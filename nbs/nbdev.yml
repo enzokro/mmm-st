@@ -1,0 +1,9 @@
+project:
+  output-dir: _docs
+
+website:
+  title: "mmm-st"
+  site-url: "https://enzokro.github.io/mmm-st"
+  description: "Style transfer with interactive prompt."
+  repo-branch: main
+  repo-url: "https://github.com/enzokro/mmm-st"
