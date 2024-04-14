@@ -21,10 +21,11 @@ class Config:
     HOST = '0.0.0.0'
     PORT = 8989
     CAP_PROPS = {'CAP_PROP_FPS': 30}
+    TRANSFORM_TYPE = "kandinsky"
 
 class VideoStreamer:
     """ Continuously reads frames from a video capture source. """
-    def __init__(self, video_source=0):
+    def __init__(self, video_source='/dev/video0'):
         self.cap = cv2.VideoCapture(video_source)
         for prop, value in Config.CAP_PROPS.items():
             self.cap.set(getattr(cv2, prop), value)
