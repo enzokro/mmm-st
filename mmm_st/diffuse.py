@@ -15,7 +15,7 @@ from diffusers import AutoPipelineForImage2Image
 from diffusers import StableDiffusionControlNetPipeline, ControlNetModel, UniPCMultistepScheduler
 from diffusers import KandinskyV22PriorEmb2EmbPipeline, KandinskyV22ControlnetImg2ImgPipeline
 from controlnet_aux import OpenposeDetector
-from .config import Config
+from mmm_st.config import Config
 
 # %% ../nbs/01_diffuse.ipynb 4
 class BaseTransformer:

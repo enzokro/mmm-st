@@ -15,9 +15,9 @@ from PIL import Image
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request, send_file, current_app, Response, render_template, stream_with_context
 import huggingface_hub
-from .video import VideoStreamer, interpolate_images
-from .diffuse import get_transformer
-from .config import Config
+from mmm_st.video import VideoStreamer, interpolate_images
+from mmm_st.diffuse import get_transformer
+from mmm_st.config import Config
 
 # %% ../nbs/02_app.ipynb 3
 app = Flask(__name__)
