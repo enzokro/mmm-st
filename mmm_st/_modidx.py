@@ -89,4 +89,5 @@ d = { 'settings': { 'branch': 'main',
                                                                                'mmm_st/video.py'),
                               'mmm_st.video.VideoStreamer.start': ('video.html#videostreamer.start', 'mmm_st/video.py'),
                               'mmm_st.video.VideoStreamer.stop': ('video.html#videostreamer.stop', 'mmm_st/video.py'),
+                              'mmm_st.video.convert_to_pil_image': ('video.html#convert_to_pil_image', 'mmm_st/video.py'),
                               'mmm_st.video.interpolate_images': ('video.html#interpolate_images', 'mmm_st/video.py')}}}

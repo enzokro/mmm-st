@@ -27,7 +27,7 @@ config = {
   },
   "image_size": (256, 256),
   "num_steps": 20,
-  "device": "cuda",
+  "device": "mps",
   "seed": 12297829382473034410,
   "cap_props": {
     "CAP_PROP_FPS": 15

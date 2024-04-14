@@ -15,7 +15,7 @@ from PIL import Image
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request, send_file, current_app, Response, render_template, stream_with_context
 import huggingface_hub
-from mmm_st.video import VideoStreamer, interpolate_images
+from mmm_st.video import VideoStreamer, interpolate_images, convert_to_pil_image
 from mmm_st.diffuse import get_transformer
 from mmm_st.config import Config
 
@@ -25,7 +25,7 @@ app = Flask(__name__)
 load_dotenv()
 
 huggingface_hub.login(
-    token=os.environ.get("HUGGINGFACE_TOKEN"),
+    token=os.environ.get("HF_TOKEN"),
     add_to_git_credential=True,
 )
 
@@ -87,6 +87,7 @@ def get_transformed_image():
         return jsonify({"error": "No image available"}), 404
     return serve_pil_image(image)
 
+
 @app.route('/stream')
 def stream():
     def generate():
@@ -100,7 +101,8 @@ def stream():
                     image = current_app.shared_resources.current_frame
                     if image is not None:
                         img_byte_arr = BytesIO()
-                        Image.fromarray(image).save(img_byte_arr, format='JPEG')
+                        pil_image = convert_to_pil_image(image)
+                        pil_image.save(img_byte_arr, format='JPEG')
                         img_byte_arr.seek(0)
                         encoded_img = base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
                         yield f"data: {encoded_img}\n\n"
