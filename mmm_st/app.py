@@ -17,8 +17,6 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Shared global variable for the prompt
-current_prompt = None
 
 # Import and use configurations from an external module if necessary
 class Config:
@@ -45,6 +43,11 @@ class VideoStreamer:
 
     def release(self):
         self.cap.release()
+
+# Shared global variables
+current_prompt = None
+video_streamer = VideoStreamer() 
+image_transformer = get_transformer(Config.TRANSFORM_TYPE)()
 
 
 def transform_frame(video_streamer, image_transformer, previous_frame, prompt=None):
@@ -107,8 +110,8 @@ def set_prompt():
 def stream():
     def generate():
         global current_prompt
-        video_streamer = VideoStreamer()  # Assuming this is properly initialized elsewhere
-        image_transformer = get_transformer(Config.TRANSFORM_TYPE)()  # Make sure this is defined
+        global video_streamer
+        global image_transformer
         previous_frame = None
 
         try:
