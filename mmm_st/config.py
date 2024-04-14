@@ -25,9 +25,13 @@ config = {
     "host": "localhost",
     "port": 8989
   },
+  "image_size": (256, 256),
+  "num_steps": 20,
+  "device": "cuda",
   "cap_props": {
     "CAP_PROP_FPS": 15
-  }
+  },
+  "negative_prompt": "lowres, text, error, cropped, worst quality, low quality, jpeg artifacts, ugly, duplicate, morbid, mutilated, out of frame, extra fingers, mutated hands, poorly drawn hands, poorly drawn face, mutation, deformed, blurry, dehydrated, bad anatomy, bad proportions, extra limbs, cloned face, disfigured, gross proportions, malformed limbs, missing arms, missing legs, extra arms, extra legs, fused fingers, too many fingers, long neck, username, watermark, signature",
 }
 
 
@@ -46,6 +50,12 @@ class Config:
     CONTROL_NET_POSE_MODEL = config['models']['control_net_pose']
     STABLE_DIFFUSION_MODEL = config['models']['stable_diffusion']
     POSE_DET_MODEL = config['models']['pose_det_model']
+    DEVICE = config['device']
+
+    # Image size
+    IMAGE_SIZE = config['image_size']
+    NUM_STEPS = config['num_steps']
+    NEGATIVE_PROMPT = config['negative_prompt']
 
     # Application settings
     HOST = os.environ.get('HOST', config['app_settings']['host'])

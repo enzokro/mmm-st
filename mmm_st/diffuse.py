@@ -2,9 +2,9 @@
 
 # %% auto 0
 __all__ = ['BaseTransformer', 'ImageTransformer', 'EdgeImageTransformer', 'PoseImageTransformer', 'CombinedImageTransformer',
-           'get_transformer']
+           'KandinskyTransformer', 'get_transformer']
 
-# %% ../nbs/01_diffuse.ipynb 2
+# %% ../nbs/01_diffuse.ipynb 3
 import numpy as np
 from PIL import Image
 import cv2
@@ -12,34 +12,49 @@ from fastcore.basics import store_attr
 from diffusers import AutoPipelineForImage2Image
 from diffusers import StableDiffusionControlNetPipeline, ControlNetModel, UniPCMultistepScheduler
 import torch
+torch.set_default_device("mps")
 from diffusers.utils import load_image
 from controlnet_aux import OpenposeDetector
 from .config import Config
+from PIL import Image
+from diffusers import KandinskyV22PriorEmb2EmbPipeline, KandinskyV22ControlnetImg2ImgPipeline
+from transformers import pipeline
 
 
-# %% ../nbs/01_diffuse.ipynb 3
+# %% ../nbs/01_diffuse.ipynb 4
 class BaseTransformer:
     def __init__(
             self,
             model_name=Config.MODEL_NAME,
-            device='cuda',
+            device=Config.DEVICE,
+            img_size=Config.IMG_SIZE,
+            num_steps=Config.NUM_STEPS,
         ):
         store_attr()
-        
+        self._initialize_pipeline()
+
+    def _initialize_pipeline(self):
+        raise NotImplementedError("Subclasses should implement this method.")
+
     def transform_image(self, image, prompt):
         raise NotImplementedError("This method should be overridden by subclasses.")
-    
-    def __call__(self, *args, **kwargs):
-        return self.transform_image(*args, **kwargs)
 
-# %% ../nbs/01_diffuse.ipynb 4
+    def prepare_image(self, image):
+        """ Prepare the image for transformation, converting it to the correct size and format. """
+        if isinstance(image, np.ndarray):
+            image = Image.fromarray(image)
+        return image.resize(self.img_size)
+
+
+# %% ../nbs/01_diffuse.ipynb 5
 class ImageTransformer(BaseTransformer):
     """
     A class to manage image transformation using the Hugging Face diffusers pipeline.
     """
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.pipeline = self._initialize_pipeline()
+        store_attr()  # Store initialization parameters for easy access later
+        self._initialize_pipeline()
 
     def _initialize_pipeline(self):
         """
@@ -48,11 +63,12 @@ class ImageTransformer(BaseTransformer):
         pipe = AutoPipelineForImage2Image.from_pretrained(
             self.model_name,
             torch_dtype=torch.float16,
-            use_safetensors=True,
+            use_safetensors=True
         ).to(self.device)
         pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)
         pipe.enable_model_cpu_offload()
-        return pipe
+        self.pipeline = pipe
+        
 
     def transform_image(self, image, prompt):
         """
@@ -65,20 +81,25 @@ class ImageTransformer(BaseTransformer):
         Returns:
             PIL.Image: The transformed image.
         """
-        transformed_image = self.pipeline(prompt, image=image).images[0]
-        return transformed_image
+        image = self.prepare_image(image)
 
-# %% ../nbs/01_diffuse.ipynb 5
+        return self.pipeline(
+            prompt=prompt, 
+            image=image,
+        ).images[0]
+
+# %% ../nbs/01_diffuse.ipynb 6
 class EdgeImageTransformer(BaseTransformer):
     def __init__(
             self,
             *args, 
-            canny_control_model=Config.CONTROL_NET_CANNY_MODEL,
+            canny_control_model,
+            low_threshold=100,
+            high_threshold=200,
             **kwargs,
         ):
+        store_attr()
         super().__init__(*args, **kwargs)
-        self.canny_control_model = canny_control_model
-        self.pipeline = self._initialize_pipeline()
 
     def _initialize_pipeline(self):
         controlnet = ControlNetModel.from_pretrained(self.canny_control_model, torch_dtype=torch.float16)
@@ -89,71 +110,69 @@ class EdgeImageTransformer(BaseTransformer):
         ).to(self.device)
         pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)
         pipe.enable_model_cpu_offload()
-        return pipe
+        self.pipeline = pipe
 
-    def transform_image(self, image, prompt, low_threshold=100, high_threshold=200):
-        edge_image = cv2.Canny(image, low_threshold, high_threshold)
-        edge_image = np.stack((edge_image, edge_image, edge_image), axis=-1)  # Convert to 3-channel image
-        transformed_images = self.pipeline(
-            prompt=[prompt],
-            images=[Image.fromarray(edge_image)],
-            num_inference_steps=20
-        ).images
-        return transformed_images[0]
+    def transform_image(self, image, prompt):
+        edge_image = cv2.Canny(image, self.low_threshold, self.high_threshold)
+        edge_image = np.stack((edge_image, edge_image, edge_image), axis=-1)
+        edge_image = self.prepare_image(edge_image)
+        return self.pipeline(
+            prompt=prompt,
+            images=[edge_image],
+            num_inference_steps=self.num_steps,
+        ).images[0]
 
-# %% ../nbs/01_diffuse.ipynb 6
+# %% ../nbs/01_diffuse.ipynb 7
 class PoseImageTransformer(BaseTransformer):
     def __init__(
             self,
-            *args, 
+            *args,
             pose_control_model=Config.CONTROL_NET_CANNY_MODEL,
             pose_det_model=Config.POSE_DET_MODEL,
             **kwargs,
         ):
+        store_attr()
         super().__init__(*args, **kwargs)
-        self.pose_control_model = pose_control_model
-        self.pose_det_model = pose_det_model
-        self.pipeline = self._initialize_pipeline()
-        self.pose_model = OpenposeDetector.from_pretrained(self.pose_det_model)
 
     def _initialize_pipeline(self):
-        controlnet = ControlNetModel.from_pretrained(
-            self.pose_control_model, torch_dtype=torch.float16
-        )
+        self.pose_model = OpenposeDetector.from_pretrained(self.pose_det_model)
+        controlnet = ControlNetModel.from_pretrained(self.pose_control_model, torch_dtype=torch.float16)
         pipe = StableDiffusionControlNetPipeline.from_pretrained(
-            self.model_name, controlnet=controlnet, torch_dtype=torch.float16
+            self.model_name,
+            controlnet=controlnet,
+            torch_dtype=torch.float16
         ).to(self.device)
         pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)
         pipe.enable_model_cpu_offload()
-        return pipe
+        self.pipeline = pipe
 
     def transform_image(self, image, prompt):
         pose_image = self.pose_model(image)
-        transformed_images = self.pipeline(
-            prompt=[prompt],
-            images=[pose_image],
-            num_inference_steps=20
-        ).images
-        return transformed_images[0]
+        pose_image = self.prepare_image(pose_image)
+        return self.pipeline(
+            prompt=prompt, 
+            images=[pose_image], 
+            num_inference_steps=self.num_steps,
+        ).images[0]
 
-# %% ../nbs/01_diffuse.ipynb 7
+
+# %% ../nbs/01_diffuse.ipynb 8
 class CombinedImageTransformer(BaseTransformer):
     def __init__(
             self,
             *args, 
-            canny_control_model=Config.CONTROL_NET_CANNY_MODEL,
-            pose_control_model=Config.CONTROL_NET_CANNY_MODEL,
-            pose_det_model=Config.POSE_DET_MODEL,
+            canny_control_model,
+            pose_control_model,
+            pose_det_model,
+            low_threshold=100,
+            high_threshold=200,
             **kwargs,
         ):
+        store_attr()
         super().__init__(*args, **kwargs)
-        self.canny_control_model = canny_control_model
-        self.pose_control_model = pose_control_model
-        self.pose_det_model = pose_det_model
-        self.pipeline = self._initialize_pipeline()
-        self.pose_model = OpenposeDetector.from_pretrained(self.pose_det_model)
 
     def _initialize_pipeline(self):
+        self.pose_model = OpenposeDetector.from_pretrained(self.pose_det_model)
         controlnet = [
             ControlNetModel.from_pretrained(self.pose_control_model, torch_dtype=torch.float16),
             ControlNetModel.from_pretrained(self.canny_control_model, torch_dtype=torch.float16),
@@ -165,49 +184,81 @@ class CombinedImageTransformer(BaseTransformer):
         ).to(self.device)
         pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)
         pipe.enable_model_cpu_offload()
-        return pipe
+        self.pipeline = pipe
 
     def transform_image(self, image, prompt):
-        """
-        Transforms an image based on a given prompt using combined control nets for pose and edges.
-
-        Args:
-            image: A numpy array of the image to transform.
-            prompt (str): The creative prompt to guide the image transformation.
-
-        Returns:
-            PIL.Image: The transformed image.
-        """
-        prepared_pose_image = self.prepare_pose_image(image)
-        prepared_canny_image = self.prepare_canny_image(image)
-        images = [prepared_pose_image, prepared_canny_image]
-        negative_prompt = "monochrome, lowres, bad anatomy, worst quality, low quality"
-        controlnet_conditioning_scale = [1.0, 0.8]
-        num_inference_steps = 20
-
-        transformed_images = self.pipeline(
+        prepared_pose_image = self.prepare_image(self.pose_model(image))
+        edge_image = cv2.Canny(image, self.low_threshold, self.high_threshold)
+        edge_image = np.stack((edge_image, edge_image, edge_image), axis=-1)
+        prepared_canny_image = self.prepare_image(edge_image)
+        return self.pipeline(
             prompt=prompt,
-            images=images,
-            num_inference_steps=num_inference_steps,
-            generator=torch.Generator(device="cpu").manual_seed(1),
-            negative_prompt=[negative_prompt],
-            controlnet_conditioning_scale=controlnet_conditioning_scale
-        ).images
+            images=[prepared_pose_image, prepared_canny_image],
+            negative_prompt=[Config.NEGATIVE_PROMPT],
+            num_inference_steps=self.num_steps,
+            controlnet_conditioning_scale=[1.0, 0.8]
+        ).images[0]
 
-        return transformed_images[0]
+# %% ../nbs/01_diffuse.ipynb 9
+class KandinskyTransformer(BaseTransformer):
+    def __init__(
+            self,
+            *args, 
+            model_name=Config.MODEL_NAME,
+            device=Config.DEVICE,
+            img_size=Config.IMG_SIZE,
+            num_steps=Config.NUM_STEPS,
+            **kwargs,
+        ):
+        store_attr()
+        super().__init__(*args, model_name=model_name, device=device, img_size=img_size, num_steps=num_steps, **kwargs)
+        self._initialize_pipeline()
 
-    def prepare_canny_image(self, image, low_threshold=100, high_threshold=200):
-        canny_image = cv2.Canny(image, low_threshold, high_threshold)
-        zero_start = canny_image.shape[1] // 4
-        zero_end = zero_start + canny_image.shape[1] // 2
-        canny_image[:, zero_start:zero_end] = 0
-        canny_image = np.stack((canny_image, canny_image, canny_image), axis=-1)
-        return Image.fromarray(canny_image)
+    def _initialize_pipeline(self):
+        self.depth_estimator = pipeline("depth-estimation", device=self.device)
+        self.prior_pipeline = KandinskyV22PriorEmb2EmbPipeline.from_pretrained(
+            "kandinsky-community/kandinsky-2-2-prior",
+            torch_dtype=torch.float16,
+            use_safetensors=True,
+        ).to(self.device)
 
-    def prepare_pose_image(self, image):
-        return self.pose_model(image)
+        self.pipeline = KandinskyV22ControlnetImg2ImgPipeline.from_pretrained(
+            "kandinsky-community/kandinsky-2-2-controlnet-depth",
+            torch_dtype=torch.float16,
+            use_safetensors=True,
+        ).to(self.device)
+        self.pipeline.enable_model_cpu_offload()
 
-# %% ../nbs/01_diffuse.ipynb 8
+    def make_hint(self, image):
+        image = self.depth_estimator(image)["depth"]
+        image = np.array(image)
+        image = image[:, :, None]
+        image = np.concatenate([image, image, image], axis=-1)
+        detected_map = torch.from_numpy(image).float() / 255.0
+        hint = detected_map.permute(2, 0, 1)
+        return hint
+
+    def transform_image(self, image, prompt, negative_prompt, generator):
+        img = self.prepare_image(image)
+        hint = self.make_hint(img).unsqueeze(0).half().to(self.device)
+        
+        img_emb = self.prior_pipeline(prompt=prompt, image=img, strength=0.85, generator=generator)
+        negative_emb = self.prior_pipeline(prompt=negative_prompt, image=img, strength=1, generator=generator)
+        
+        result_image = self.pipeline(
+            image=img, 
+            strength=0.7, 
+            image_embeds=img_emb.image_embeds, 
+            negative_image_embeds=negative_emb.image_embeds, 
+            hint=hint, 
+            num_inference_steps=self.num_steps, 
+            generator=generator, 
+            height=self.img_size[0], 
+            width=self.img_size[1],
+        ).images[0]
+        return result_image
+
+# %% ../nbs/01_diffuse.ipynb 10
 def get_transformer(transformer_type):
     if transformer_type == "regular":
         return ImageTransformer()
@@ -219,9 +270,4 @@ def get_transformer(transformer_type):
         return CombinedImageTransformer()
     else:
         raise ValueError("Unknown transformer type provided")
-
-
-# %% ../nbs/01_diffuse.ipynb 10
-if __name__ == "__main__":
-    app.run(debug=True)
 
