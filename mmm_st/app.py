@@ -27,13 +27,13 @@ class Config:
 
 class VideoStreamer:
     """ Continuously reads frames from a video capture source. """
-    def __init__(self, video_source='/dev/video0'):
-        self.cap = cv2.VideoCapture(video_source)
-        for prop, value in Config.CAP_PROPS.items():
-            self.cap.set(getattr(cv2, prop), value)
+    def __init__(self, device_path='/dev/video0'):
+        self.cap = cv2.VideoCapture(device_path)
         if not self.cap.isOpened():
             logger.error("Failed to open video source")
             raise ValueError("Video source cannot be opened")
+        for prop, value in Config.CAP_PROPS.items():
+            self.cap.set(getattr(cv2, prop), value)
 
     def get_current_frame(self):
         ret, frame = self.cap.read()
@@ -46,11 +46,12 @@ class VideoStreamer:
 
 # Shared global variables
 current_prompt = None
-video_streamer = VideoStreamer() 
+path = '/dev/video0'
+video_streamer = VideoStreamer('/dev/video0') 
 image_transformer = get_transformer(Config.TRANSFORM_TYPE)()
 
 
-def transform_frame(video_streamer, image_transformer, previous_frame, prompt=None):
+def transform_frame(previous_frame, prompt=None):
     """
     Fetches a frame from the video streamer, applies a transformation based on the provided prompt,
     and interpolates it with the previous frame.
@@ -64,6 +65,8 @@ def transform_frame(video_streamer, image_transformer, previous_frame, prompt=No
     Returns:
         Image.Image: The updated frame after transformation and interpolation.
     """
+    global video_streamer
+    global image_transformer
     current_frame = video_streamer.get_current_frame()
     if current_frame is None:
         return previous_frame  # Return the previous frame if no new frame is captured
@@ -117,8 +120,6 @@ def stream():
         try:
             while True:
                 output_frame = transform_frame(
-                    video_streamer, 
-                    image_transformer, 
                     previous_frame, 
                     prompt=current_prompt)
                 previous_frame = output_frame
