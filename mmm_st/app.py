@@ -27,7 +27,7 @@ class Config:
 
 class VideoStreamer:
     """ Continuously reads frames from a video capture source. """
-    def __init__(self, video_source='/dev/video1'):
+    def __init__(self, video_source='/dev/video0'):
         self.cap = cv2.VideoCapture(video_source)
         for prop, value in Config.CAP_PROPS.items():
             self.cap.set(getattr(cv2, prop), value)
