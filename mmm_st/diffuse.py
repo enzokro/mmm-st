@@ -15,7 +15,7 @@ import torch
 torch.set_default_device("mps")
 from diffusers.utils import load_image
 from controlnet_aux import OpenposeDetector
-from .config import Config
+from config import Config
 from PIL import Image
 from diffusers import KandinskyV22PriorEmb2EmbPipeline, KandinskyV22ControlnetImg2ImgPipeline
 from transformers import pipeline
@@ -27,7 +27,7 @@ class BaseTransformer:
             self,
             model_name=Config.MODEL_NAME,
             device=Config.DEVICE,
-            img_size=Config.IMG_SIZE,
+            img_size=Config.IMAGE_SIZE,
             num_steps=Config.NUM_STEPS,
         ):
         store_attr()
@@ -44,6 +44,9 @@ class BaseTransformer:
         if isinstance(image, np.ndarray):
             image = Image.fromarray(image)
         return image.resize(self.img_size)
+    
+    def __call__(self, image, prompt):
+        return self.transform_image(image, prompt)
 
 
 # %% ../nbs/01_diffuse.ipynb 5
@@ -64,9 +67,11 @@ class ImageTransformer(BaseTransformer):
             self.model_name,
             torch_dtype=torch.float16,
             use_safetensors=True
-        ).to(self.device)
+        )
         pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)
-        pipe.enable_model_cpu_offload()
+        pipe = pipe.to(self.device)
+        if 'cuda' in self.device:
+            pipe.enable_model_cpu_offload()
         self.pipeline = pipe
         
 
@@ -107,9 +112,11 @@ class EdgeImageTransformer(BaseTransformer):
             self.model_name,
             controlnet=controlnet,
             torch_dtype=torch.float16
-        ).to(self.device)
+        )
         pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)
-        pipe.enable_model_cpu_offload()
+        pipe = pipe.to(self.device)
+        if 'cuda' in self.device:
+            pipe.enable_model_cpu_offload()
         self.pipeline = pipe
 
     def transform_image(self, image, prompt):
@@ -141,9 +148,11 @@ class PoseImageTransformer(BaseTransformer):
             self.model_name,
             controlnet=controlnet,
             torch_dtype=torch.float16
-        ).to(self.device)
+        )
         pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)
-        pipe.enable_model_cpu_offload()
+        pipe = pipe.to(self.device)
+        if 'cuda' in self.device:
+            pipe.enable_model_cpu_offload()
         self.pipeline = pipe
 
     def transform_image(self, image, prompt):
@@ -181,9 +190,11 @@ class CombinedImageTransformer(BaseTransformer):
             self.model_name,
             controlnet=controlnet,
             torch_dtype=torch.float16
-        ).to(self.device)
+        )
         pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)
-        pipe.enable_model_cpu_offload()
+        pipe = pipe.to(self.device)
+        if 'cuda' in self.device:
+            pipe.enable_model_cpu_offload()
         self.pipeline = pipe
 
     def transform_image(self, image, prompt):
@@ -201,17 +212,9 @@ class CombinedImageTransformer(BaseTransformer):
 
 # %% ../nbs/01_diffuse.ipynb 9
 class KandinskyTransformer(BaseTransformer):
-    def __init__(
-            self,
-            *args, 
-            model_name=Config.MODEL_NAME,
-            device=Config.DEVICE,
-            img_size=Config.IMG_SIZE,
-            num_steps=Config.NUM_STEPS,
-            **kwargs,
-        ):
+    def __init__(self, *args, **kwargs):
         store_attr()
-        super().__init__(*args, model_name=model_name, device=device, img_size=img_size, num_steps=num_steps, **kwargs)
+        super().__init__(*args, **kwargs)
         self._initialize_pipeline()
 
     def _initialize_pipeline(self):
@@ -227,7 +230,8 @@ class KandinskyTransformer(BaseTransformer):
             torch_dtype=torch.float16,
             use_safetensors=True,
         ).to(self.device)
-        self.pipeline.enable_model_cpu_offload()
+        if 'cuda' in self.device:
+            self.pipeline.enable_model_cpu_offload()
 
     def make_hint(self, image):
         image = self.depth_estimator(image)["depth"]
@@ -261,13 +265,15 @@ class KandinskyTransformer(BaseTransformer):
 # %% ../nbs/01_diffuse.ipynb 10
 def get_transformer(transformer_type):
     if transformer_type == "regular":
-        return ImageTransformer()
+        return ImageTransformer
     elif transformer_type == "canny":
-        return EdgeImageTransformer()
+        return EdgeImageTransformer
     elif transformer_type == "pose":
-        return PoseImageTransformer()
+        return PoseImageTransformer
     elif transformer_type == "combined":
-        return CombinedImageTransformer()
+        return CombinedImageTransformer
+    elif transformer_type == "kandinsky":
+        return KandinskyTransformer
     else:
         raise ValueError("Unknown transformer type provided")
 
