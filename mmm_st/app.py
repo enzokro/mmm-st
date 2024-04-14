@@ -9,12 +9,16 @@ import logging
 import threading
 from mmm_st.config import Config
 from mmm_st.diffuse import get_transformer
+from mmm_st.video import convert_to_pil_image
 
 app = Flask(__name__)
 
 # Setup basic logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Shared global variable for the prompt
+current_prompt = None
 
 # Import and use configurations from an external module if necessary
 class Config:
@@ -91,27 +95,34 @@ def index():
 
 @app.route('/set_prompt', methods=['POST'])
 def set_prompt():
+    global current_prompt
     prompt = request.json.get('prompt')
     if not prompt:
         return jsonify({"error": "Prompt is required"}), 400
-    # Here you might update some global state or pass this to your transformation logic
+    current_prompt = prompt
     return jsonify({"message": "Prompt set successfully"})
 
 
 @app.route('/stream')
 def stream():
     def generate():
+        global current_prompt
         video_streamer = VideoStreamer()  # Assuming this is properly initialized elsewhere
         image_transformer = get_transformer(Config.TRANSFORM_TYPE)()  # Make sure this is defined
         previous_frame = None
 
         try:
             while True:
-                output_frame = transform_frame(video_streamer, image_transformer, previous_frame, prompt="your_prompt_here")
+                output_frame = transform_frame(
+                    video_streamer, 
+                    image_transformer, 
+                    previous_frame, 
+                    prompt=current_prompt)
                 previous_frame = output_frame
                 
                 img_byte_arr = BytesIO()
-                output_frame.save(img_byte_arr, format='JPEG')
+                pil_image = convert_to_pil_image(output_frame)
+                pil_image.save(img_byte_arr, format='JPEG')
                 img_byte_arr.seek(0)
                 encoded_img = base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
                 yield f"data: {encoded_img}\n\n"
