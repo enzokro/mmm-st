@@ -6,7 +6,9 @@ from PIL import Image
 import numpy as np
 import cv2  # Using OpenCV for video capture
 import logging
+import atexit
 import threading
+import torch
 from mmm_st.config import Config
 from mmm_st.diffuse import get_transformer
 from mmm_st.video import convert_to_pil_image
@@ -117,24 +119,34 @@ def stream():
         global image_transformer
         previous_frame = None
 
-        try:
-            while True:
-                output_frame = transform_frame(
-                    previous_frame, 
-                    prompt=current_prompt)
-                previous_frame = output_frame
-                
-                img_byte_arr = BytesIO()
-                pil_image = convert_to_pil_image(output_frame)
-                pil_image.save(img_byte_arr, format='JPEG')
-                img_byte_arr.seek(0)
-                encoded_img = base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
-                yield f"data: {encoded_img}\n\n"
-                time.sleep(1 / 30)  # Control frame rate
-        finally:
-            video_streamer.release()
+        while True:
+            output_frame = transform_frame(
+                previous_frame, 
+                prompt=current_prompt,
+            )
+            previous_frame = output_frame
+            
+            img_byte_arr = BytesIO()
+            pil_image = convert_to_pil_image(output_frame)
+            pil_image.save(img_byte_arr, format='JPEG')
+            img_byte_arr.seek(0)
+            encoded_img = base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
+            yield f"data: {encoded_img}\n\n"
+            time.sleep(1 / 30)  # Control frame rate
 
     return Response(stream_with_context(generate()), mimetype='text/event-stream')
 
-if __name__ == "__main__":
+def cleanup():
+    print("Application is shutting down. Cleaning up resources.")
+    global video_streamer
+    global image_transformer
+    video_streamer.release()
+    del image_transformer
+    torch.cuda.clear_cache()
+
+def main():
+    atexit.register(cleanup)
     app.run(host=Config.HOST, port=Config.PORT, debug=True, threaded=True)
+
+if __name__ == "__main__":
+    main()
