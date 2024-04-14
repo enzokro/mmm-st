@@ -5,24 +5,27 @@ __all__ = ['app', 'SharedResources', 'TransformationThread', 'index', 'set_promp
            'serve_pil_image', 'cleanup', 'main']
 
 # %% ../nbs/02_app.ipynb 2
+import os
 import time
 import base64
 from io import BytesIO
 import threading
 import atexit
 from PIL import Image
+from dotenv import load_dotenv
 from flask import Flask, jsonify, request, send_file, current_app, Response, render_template, stream_with_context
-from video import VideoStreamer, interpolate_images
-from diffuse import get_transformer
-from config import Config
 import huggingface_hub
-
+from .video import VideoStreamer, interpolate_images
+from .diffuse import get_transformer
+from .config import Config
 
 # %% ../nbs/02_app.ipynb 3
 app = Flask(__name__)
 
+load_dotenv()
+
 huggingface_hub.login(
-    token="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",
+    token=os.environ.get("HUGGINGFACE_TOKEN"),
     add_to_git_credential=True,
 )
 

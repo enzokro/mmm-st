@@ -28,6 +28,7 @@ config = {
   "image_size": (256, 256),
   "num_steps": 20,
   "device": "cuda",
+  "seed": 12297829382473034410,
   "cap_props": {
     "CAP_PROP_FPS": 15
   },
@@ -51,11 +52,13 @@ class Config:
     STABLE_DIFFUSION_MODEL = config['models']['stable_diffusion']
     POSE_DET_MODEL = config['models']['pose_det_model']
     DEVICE = config['device']
+    SEED = config['seed']
 
     # Image size
     IMAGE_SIZE = config['image_size']
     NUM_STEPS = config['num_steps']
     NEGATIVE_PROMPT = config['negative_prompt']
+
 
     # Application settings
     HOST = os.environ.get('HOST', config['app_settings']['host'])

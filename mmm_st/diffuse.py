@@ -5,21 +5,17 @@ __all__ = ['BaseTransformer', 'ImageTransformer', 'EdgeImageTransformer', 'PoseI
            'KandinskyTransformer', 'get_transformer']
 
 # %% ../nbs/01_diffuse.ipynb 3
-import numpy as np
 from PIL import Image
+import numpy as np
 import cv2
+import torch
 from fastcore.basics import store_attr
+from transformers import pipeline
 from diffusers import AutoPipelineForImage2Image
 from diffusers import StableDiffusionControlNetPipeline, ControlNetModel, UniPCMultistepScheduler
-import torch
-torch.set_default_device("mps")
-from diffusers.utils import load_image
-from controlnet_aux import OpenposeDetector
-from config import Config
-from PIL import Image
 from diffusers import KandinskyV22PriorEmb2EmbPipeline, KandinskyV22ControlnetImg2ImgPipeline
-from transformers import pipeline
-
+from controlnet_aux import OpenposeDetector
+from .config import Config
 
 # %% ../nbs/01_diffuse.ipynb 4
 class BaseTransformer:
@@ -45,8 +41,8 @@ class BaseTransformer:
             image = Image.fromarray(image)
         return image.resize(self.img_size)
     
-    def __call__(self, image, prompt):
-        return self.transform_image(image, prompt)
+    def __call__(self, *args, **kwargs):
+        return self.transform_image(*args, **kwargs)
 
 
 # %% ../nbs/01_diffuse.ipynb 5
@@ -215,6 +211,7 @@ class KandinskyTransformer(BaseTransformer):
     def __init__(self, *args, **kwargs):
         store_attr()
         super().__init__(*args, **kwargs)
+        self.generator = torch.Generator(device="cpu").manual_seed(Config.SEED)
         self._initialize_pipeline()
 
     def _initialize_pipeline(self):
@@ -228,7 +225,6 @@ class KandinskyTransformer(BaseTransformer):
         self.pipeline = KandinskyV22ControlnetImg2ImgPipeline.from_pretrained(
             "kandinsky-community/kandinsky-2-2-controlnet-depth",
             torch_dtype=torch.float16,
-            use_safetensors=True,
         ).to(self.device)
         if 'cuda' in self.device:
             self.pipeline.enable_model_cpu_offload()
@@ -242,12 +238,17 @@ class KandinskyTransformer(BaseTransformer):
         hint = detected_map.permute(2, 0, 1)
         return hint
 
-    def transform_image(self, image, prompt, negative_prompt, generator):
+    def transform_image(
+            self, 
+            image, 
+            prompt, 
+            negative_prompt=Config.NEGATIVE_PROMPT, 
+        ):
         img = self.prepare_image(image)
         hint = self.make_hint(img).unsqueeze(0).half().to(self.device)
         
-        img_emb = self.prior_pipeline(prompt=prompt, image=img, strength=0.85, generator=generator)
-        negative_emb = self.prior_pipeline(prompt=negative_prompt, image=img, strength=1, generator=generator)
+        img_emb = self.prior_pipeline(prompt=prompt, image=img, strength=0.85, generator=self.generator)
+        negative_emb = self.prior_pipeline(prompt=negative_prompt, image=img, strength=1, generator=self.generator)
         
         result_image = self.pipeline(
             image=img, 
@@ -256,7 +257,7 @@ class KandinskyTransformer(BaseTransformer):
             negative_image_embeds=negative_emb.image_embeds, 
             hint=hint, 
             num_inference_steps=self.num_steps, 
-            generator=generator, 
+            generator=self.generator, 
             height=self.img_size[0], 
             width=self.img_size[1],
         ).images[0]
