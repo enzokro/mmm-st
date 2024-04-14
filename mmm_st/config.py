@@ -27,10 +27,10 @@ config = {
   },
   "image_size": (256, 256),
   "num_steps": 20,
-  "device": "mps",
+  "device": "cuda",
   "seed": 12297829382473034410,
   "cap_props": {
-    "CAP_PROP_FPS": 15
+    "CAP_PROP_FPS": 30
   },
   "negative_prompt": "lowres, text, error, cropped, worst quality, low quality, jpeg artifacts, ugly, duplicate, morbid, mutilated, out of frame, extra fingers, mutated hands, poorly drawn hands, poorly drawn face, mutation, deformed, blurry, dehydrated, bad anatomy, bad proportions, extra limbs, cloned face, disfigured, gross proportions, malformed limbs, missing arms, missing legs, extra arms, extra legs, fused fingers, too many fingers, long neck, username, watermark, signature",
 }
