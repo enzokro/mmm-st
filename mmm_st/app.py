@@ -1,12 +1,15 @@
-from flask import Flask, jsonify, request, Response, render_template, send_file, stream_with_context
+import gc
+import atexit
 from io import BytesIO
 import base64
 import time
+import logging
+from flask import Flask, jsonify, request, Response, render_template, send_file, stream_with_context
 from PIL import Image
+from diffusers import DDIMScheduler
+import torch
 import numpy as np
 import cv2  # Using OpenCV for video capture
-import logging
-import threading
 from mmm_st.config import Config
 from mmm_st.diffuse import get_transformer
 from mmm_st.video import convert_to_pil_image
@@ -24,6 +27,7 @@ class Config:
     PORT = 8989
     CAP_PROPS = {'CAP_PROP_FPS': 30}
     TRANSFORM_TYPE = "kandinsky"
+    NUM_STEPS = 40
 
 class VideoStreamer:
     """ Continuously reads frames from a video capture source. """
@@ -46,9 +50,12 @@ class VideoStreamer:
 
 # Shared global variables
 current_prompt = None
+previous_frame = None
 path = '/dev/video0'
 video_streamer = VideoStreamer('/dev/video0') 
-image_transformer = get_transformer(Config.TRANSFORM_TYPE)()
+image_transformer = get_transformer(Config.TRANSFORM_TYPE)(
+    num_steps=Config.NUM_STEPS,
+)
 
 
 def transform_frame(previous_frame, prompt=None):
@@ -79,12 +86,11 @@ def transform_frame(previous_frame, prompt=None):
 
     # Interpolate between the previous frame and the transformed image
     if previous_frame is not None:
-        output_frame = interpolate_images(previous_frame, transformed_image, alpha=0.5)
+        output_frame = interpolate_images(previous_frame, transformed_image, alpha=0.75)
     else:
         output_frame = transformed_image
 
     return output_frame
-
 
 
 def interpolate_images(image1, image2, alpha=0.5):
@@ -115,7 +121,7 @@ def stream():
         global current_prompt
         global video_streamer
         global image_transformer
-        previous_frame = None
+        global previous_frame
 
         try:
             while True:
@@ -123,6 +129,9 @@ def stream():
                     previous_frame, 
                     prompt=current_prompt)
                 previous_frame = output_frame
+
+                # set the new image as the previous, to condition on
+                image_transformer.set_image(previous_frame)
                 
                 img_byte_arr = BytesIO()
                 pil_image = convert_to_pil_image(output_frame)
@@ -136,5 +145,21 @@ def stream():
 
     return Response(stream_with_context(generate()), mimetype='text/event-stream')
 
+def cleanup():
+    print("Application is shutting down. Cleaning up resources.")
+    global video_streamer
+    global image_transformer
+    del image_transformer
+    video_streamer.release()
+    gc.collect()
+    torch.cuda.empty_cache()
+
 if __name__ == "__main__":
-    app.run(host=Config.HOST, port=Config.PORT, debug=True, threaded=True)
+    atexit.register(cleanup)
+    app.run(
+        host=Config.HOST, 
+        port=Config.PORT,
+        debug=True, 
+        threaded=True, 
+        use_reloader=False,
+    )

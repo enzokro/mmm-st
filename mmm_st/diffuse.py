@@ -25,14 +25,16 @@ class BaseTransformer:
             device=Config.DEVICE,
             img_size=Config.IMAGE_SIZE,
             num_steps=Config.NUM_STEPS,
+            negative_prompt=Config.NEGATIVE_PROMPT, 
         ):
         store_attr()
+        self.input_image = None
         self._initialize_pipeline()
 
     def _initialize_pipeline(self):
         raise NotImplementedError("Subclasses should implement this method.")
 
-    def transform_image(self, image, prompt):
+    def transform(self, image, prompt):
         raise NotImplementedError("This method should be overridden by subclasses.")
 
     def prepare_image(self, image):
@@ -41,8 +43,13 @@ class BaseTransformer:
             image = Image.fromarray(image)
         return image.resize(self.img_size)
     
-    def __call__(self, *args, **kwargs):
-        return self.transform_image(*args, **kwargs)
+    def set_image(self, image):
+        self.input_image = image
+    
+    def __call__(self, image, prompt, **kwargs):
+        inp = self.input_image or image
+        img = self.transform(inp, prompt)
+        return img
 
 
 # %% ../nbs/01_diffuse.ipynb 5
@@ -71,7 +78,7 @@ class ImageTransformer(BaseTransformer):
         self.pipeline = pipe
         
 
-    def transform_image(self, image, prompt):
+    def transform(self, image, prompt):
         """
         Transforms an image based on a given prompt using a pre-trained model.
 
@@ -115,7 +122,7 @@ class EdgeImageTransformer(BaseTransformer):
             pipe.enable_model_cpu_offload()
         self.pipeline = pipe
 
-    def transform_image(self, image, prompt):
+    def transform(self, image, prompt):
         edge_image = cv2.Canny(image, self.low_threshold, self.high_threshold)
         edge_image = np.stack((edge_image, edge_image, edge_image), axis=-1)
         edge_image = self.prepare_image(edge_image)
@@ -151,7 +158,7 @@ class PoseImageTransformer(BaseTransformer):
             pipe.enable_model_cpu_offload()
         self.pipeline = pipe
 
-    def transform_image(self, image, prompt):
+    def transform(self, image, prompt):
         pose_image = self.pose_model(image)
         pose_image = self.prepare_image(pose_image)
         return self.pipeline(
@@ -174,6 +181,11 @@ class CombinedImageTransformer(BaseTransformer):
             **kwargs,
         ):
         store_attr()
+        # manually fix some ~good args
+        self.cfg = 4.5
+        self.strength=0.9
+        self.canny_scale = 0.3
+        self.pose_scale = 0.7
         super().__init__(*args, **kwargs)
 
     def _initialize_pipeline(self):
@@ -193,17 +205,19 @@ class CombinedImageTransformer(BaseTransformer):
             pipe.enable_model_cpu_offload()
         self.pipeline = pipe
 
-    def transform_image(self, image, prompt):
+    def transform(self, image, prompt):
         prepared_pose_image = self.prepare_image(self.pose_model(image))
         edge_image = cv2.Canny(image, self.low_threshold, self.high_threshold)
         edge_image = np.stack((edge_image, edge_image, edge_image), axis=-1)
         prepared_canny_image = self.prepare_image(edge_image)
         return self.pipeline(
             prompt=prompt,
-            images=[prepared_pose_image, prepared_canny_image],
+            images=[prepared_canny_image, prepared_pose_image],
+            strength=self.strength,
+            guidance_scale=self.cfg, 
+            controlnet_conditioning_scale=[self.canny_scale, self.pose_scale],
             negative_prompt=[Config.NEGATIVE_PROMPT],
             num_inference_steps=self.num_steps,
-            controlnet_conditioning_scale=[1.0, 0.8]
         ).images[0]
 
 # %% ../nbs/01_diffuse.ipynb 9
@@ -238,21 +252,21 @@ class KandinskyTransformer(BaseTransformer):
         hint = detected_map.permute(2, 0, 1)
         return hint
 
-    def transform_image(
+    def transform(
             self, 
             image, 
             prompt, 
-            negative_prompt=Config.NEGATIVE_PROMPT, 
         ):
         img = self.prepare_image(image)
         hint = self.make_hint(img).unsqueeze(0).half().to(self.device)
         
-        img_emb = self.prior_pipeline(prompt=prompt, image=img, strength=0.85, generator=self.generator)
-        negative_emb = self.prior_pipeline(prompt=negative_prompt, image=img, strength=1, generator=self.generator)
+        img_emb = self.prior_pipeline(prompt=prompt, image=img, strength=1.0, generator=self.generator)
+        negative_emb = self.prior_pipeline(prompt=self.negative_prompt, image=img, strength=0.85, generator=self.generator)
         
         result_image = self.pipeline(
             image=img, 
-            strength=0.7, 
+            strength=0.8,
+            guidance_scale=4.5, 
             image_embeds=img_emb.image_embeds, 
             negative_image_embeds=negative_emb.image_embeds, 
             hint=hint, 
