@@ -21,7 +21,11 @@ from diffusers import (
     StableDiffusionXLControlNetImg2ImgPipeline,
     ControlNetModel,
     AutoencoderKL,
+    UNet2DConditionModel,
+    EulerDiscreteScheduler
 )
+from huggingface_hub import hf_hub_download
+from safetensors.torch import load_file
 
 app = Flask(__name__)
 
@@ -47,7 +51,10 @@ logger = logging.getLogger(__name__)
 # controlnet_model = "diffusers/controlnet-canny-sdxl-1.0"
 controlnet_model = "diffusers/controlnet-depth-sdxl-1.0"
 model_id = "stabilityai/sdxl-turbo"
-taesd_model = "madebyollin/taesdxl"
+
+base = "stabilityai/stable-diffusion-xl-base-1.0"
+repo = "ByteDance/SDXL-Lightning"
+ckpt = "sdxl_lightning_4step_unet.safetensors" # Use the correct ckpt for your step setting!
 
 torch_dtype = torch.float16
 
@@ -78,7 +85,7 @@ def get_depth_map(image):
 class SDXL_Turbo(BaseTransformer):
     def __init__(
             self,
-            cfg=1.5,
+            cfg=3.5,
             strength=1.0,
             canny_low_threshold=100,
             canny_high_threshold=200,
@@ -102,13 +109,20 @@ class SDXL_Turbo(BaseTransformer):
             "madebyollin/sdxl-vae-fp16-fix", torch_dtype=torch_dtype
         )
 
+        # Load model.
+        unet = UNet2DConditionModel.from_config(base, subfolder="unet").to("cuda", torch.float16)
+        unet.load_state_dict(load_file(hf_hub_download(repo, ckpt), device="cuda"))
         self.pipe = StableDiffusionXLControlNetImg2ImgPipeline.from_pretrained(
             model_id,
             safety_checker=None,
             use_safetensors=True,
+            unet=unet,
             controlnet=controlnet_canny,
             vae=vae,
         )
+
+        # Ensure sampler uses "trailing" timesteps.
+        self.pipe.scheduler = EulerDiscreteScheduler.from_config(self.pipe.scheduler.config, timestep_spacing="trailing")
 
         self.pipe.set_progress_bar_config(disable=True)
         self.pipe.to(device=self.device, dtype=torch_dtype).to(self.device)
@@ -165,6 +179,7 @@ class SDXL_Turbo(BaseTransformer):
             generator=self.generator,
             strength=self.strength,
             num_inference_steps=steps,
+            # guidance_scale=0,
             guidance_scale=self.cfg,
             width=self.width,
             height=self.height,
