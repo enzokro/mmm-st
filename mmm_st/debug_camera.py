@@ -51,7 +51,7 @@ class VideoStreamer:
 # Shared global variables
 current_prompt = None
 path = '/dev/video0'
-video_streamer = VideoStreamer(path) 
+video_streamer = VideoStreamer('/dev/video0') 
 previous_frame = video_streamer.get_current_frame()
 image_transformer = get_transformer(Config.TRANSFORM_TYPE)(
     num_steps=Config.NUM_STEPS,
@@ -168,7 +168,7 @@ if __name__ == "__main__":
     app.run(
         host=Config.HOST, 
         port=Config.PORT,
-        debug=False, 
+        debug=True, 
         threaded=True, 
         use_reloader=False,
     )

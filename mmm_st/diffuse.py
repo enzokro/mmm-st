@@ -47,8 +47,10 @@ class BaseTransformer:
         self.input_image = image
     
     def __call__(self, image, prompt, **kwargs):
-        inp = self.input_image or image
-        img = self.transform(inp, prompt)
+        # inp = self.input_image or image
+        # print(f'inside tfm!: {inp}')
+        img = self.transform(image, prompt)
+        # print(f'inside tfm: {img}')
         return img
 
 
@@ -173,9 +175,9 @@ class CombinedImageTransformer(BaseTransformer):
     def __init__(
             self,
             *args, 
-            canny_control_model,
-            pose_control_model,
-            pose_det_model,
+            canny_control_model=Config.CONTROL_NET_CANNY_MODEL,
+            pose_control_model=Config.CONTROL_NET_POSE_MODEL,
+            pose_det_model=Config.POSE_DET_MODEL,
             low_threshold=100,
             high_threshold=200,
             **kwargs,
@@ -207,12 +209,12 @@ class CombinedImageTransformer(BaseTransformer):
 
     def transform(self, image, prompt):
         prepared_pose_image = self.prepare_image(self.pose_model(image))
-        edge_image = cv2.Canny(image, self.low_threshold, self.high_threshold)
+        edge_image = cv2.Canny(np.array(image), self.low_threshold, self.high_threshold)
         edge_image = np.stack((edge_image, edge_image, edge_image), axis=-1)
         prepared_canny_image = self.prepare_image(edge_image)
         return self.pipeline(
-            prompt=prompt,
-            images=[prepared_canny_image, prepared_pose_image],
+            prompt=[prompt],
+            image=[prepared_canny_image, prepared_pose_image],
             strength=self.strength,
             guidance_scale=self.cfg, 
             controlnet_conditioning_scale=[self.canny_scale, self.pose_scale],
@@ -234,14 +236,16 @@ class KandinskyTransformer(BaseTransformer):
             "kandinsky-community/kandinsky-2-2-prior",
             torch_dtype=torch.float16,
             use_safetensors=True,
-        ).to(self.device)
+        )
+        self.prior_pipeline.to(device=self.device, dtype=torch.float16).to(self.device)
 
         self.pipeline = KandinskyV22ControlnetImg2ImgPipeline.from_pretrained(
             "kandinsky-community/kandinsky-2-2-controlnet-depth",
             torch_dtype=torch.float16,
-        ).to(self.device)
+        )
         if 'cuda' in self.device:
             self.pipeline.enable_model_cpu_offload()
+        self.pipeline.to(device=self.device, dtype=torch.float16).to(self.device)
 
     def make_hint(self, image):
         image = self.depth_estimator(image)["depth"]
