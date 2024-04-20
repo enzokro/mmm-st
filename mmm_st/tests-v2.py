@@ -35,7 +35,7 @@ class Config:
     PORT = 8989
     CAP_PROPS = {'CAP_PROP_FPS': 30}
     TRANSFORM_TYPE = "kandinsky"
-    NUM_STEPS = 2
+    NUM_STEPS = 4
     HEIGHT = 1024
     WIDTH = 1024
 
