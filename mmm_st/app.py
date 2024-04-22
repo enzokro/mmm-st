@@ -78,7 +78,7 @@ def get_depth_map(image):
 class SDXL_Turbo(BaseTransformer):
     def __init__(
             self,
-            cfg=1.5,
+            cfg=1.0,
             strength=1.0,
             canny_low_threshold=100,
             canny_high_threshold=200,
@@ -104,7 +104,6 @@ class SDXL_Turbo(BaseTransformer):
 
         self.pipe = StableDiffusionXLControlNetImg2ImgPipeline.from_pretrained(
             model_id,
-            safety_checker=None,
             use_safetensors=True,
             controlnet=controlnet_canny,
             vae=vae,
@@ -115,26 +114,7 @@ class SDXL_Turbo(BaseTransformer):
         if self.device != "mps":
             self.pipe.unet.to(memory_format=torch.channels_last)
 
-        # if args.taesd:
-        # self.pipe.vae = AutoencoderTiny.from_pretrained(
-        #     taesd_model, torch_dtype=torch_dtype, use_safetensors=True
-        # ).to(self.device)
-
-        # if args.torch_compile:
-        #     self.pipe.unet = torch.compile(
-        #         self.pipe.unet, mode="reduce-overhead", fullgraph=True
-        #     )
-        #     self.pipe.vae = torch.compile(
-        #         self.pipe.vae, mode="reduce-overhead", fullgraph=True
-        #     )
-        #     self.pipe(
-        #         prompt="warmup",
-        #         image=[Image.new("RGB", (768, 768))],
-        #         control_image=[Image.new("RGB", (768, 768))],
-        #     )
-
     def _initialize_pipeline(self):
-        # raise NotImplementedError("Subclasses should implement this method.")
         pass
 
     def transform(self, image, prompt) -> Image.Image:
@@ -145,9 +125,6 @@ class SDXL_Turbo(BaseTransformer):
         negative_prompt_embeds = None
         negative_pooled_prompt_embeds = None
 
-        # control_image = self.canny_torch(
-        #     image, self.canny_low_threshold, self.canny_high_threshold
-        # )
         control_image = get_depth_map(image)
         steps = self.num_steps
         if int(steps * self.strength) < 1:
@@ -278,7 +255,7 @@ def stream():
         global image_transformer
         global previous_frame
 
-        cnt, decim = 0, 3
+        cnt, decim = 0, 2
         try:
             while True:
                 output_frame = transform_frame(
@@ -290,9 +267,12 @@ def stream():
 
                 # # set the new image as the previous, to condition on
                 # image_transformer.set_image(previous_frame)
+
                 if cnt == decim:
                     img_byte_arr = BytesIO()
                     pil_image = convert_to_pil_image(output_frame)
+                    # rescale to better fit the image
+                    pil_image = pil_image.resize((1920, 1080))
                     pil_image.save(img_byte_arr, format='JPEG')
                     img_byte_arr.seek(0)
                     encoded_img = base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
