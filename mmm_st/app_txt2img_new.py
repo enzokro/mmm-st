@@ -145,25 +145,30 @@ class SDXL_Turbo(BaseTransformer):
 
 
     def make_latents(self):
-        # create uniform, shared latents
+        "Create a fixed set of latents for reproducible starting images."
         batch_size, num_images_per_prompt = 1, 1
         batch_size *= num_images_per_prompt
         num_channels_latents = self.pipe.unet.config.in_channels
         shape = (batch_size, num_channels_latents, self.height // self.pipe.vae_scale_factor, self.width // self.pipe.vae_scale_factor)
         latents = randn_tensor(shape, generator=self.generator, device=self.device, dtype=torch_dtype)
-        # print('local latents:', latents.shape, latents.dtype, latents.device, latents.max().item(), latents.min().item(), latents.mean().item())
         return latents
     
     def refresh_latents(self):
+        "Grabs a new set of latents to refresh the starting image generation."
         self.latents = self.make_latents()
 
     def get_latents(self):
+        "Returns a copy of the current latents, to prevent them from being overriden."
         return self.latents.clone()
 
     def _initialize_pipeline(self):
         pass
 
     def transform(self, image, prompt) -> Image.Image:
+        """Transforms the given `image` based on the `prompt`.
+        
+        Uses a controlnet to condition and manage the generation. 
+        """
 
         # work on either the given image or the stored `input_image`
         image = self.input_image or image
@@ -197,7 +202,7 @@ class SDXL_Turbo(BaseTransformer):
 
 
 class VideoStreamer:
-    """ Continuously reads frames from a video capture source. """
+    "Continuously reads frames from a video capture source."
     def __init__(self, device_path='/dev/video0'):
         self.cap = cv2.VideoCapture(device_path)
         if not self.cap.isOpened():
