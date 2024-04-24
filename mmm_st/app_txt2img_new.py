@@ -18,12 +18,14 @@ from fastcore.basics import store_attr
 
 # tests with SDXL Lightning
 from diffusers import (
+    StableDiffusionXLControlNetPipeline,
     StableDiffusionXLControlNetImg2ImgPipeline,
     ControlNetModel,
     AutoencoderKL,
     UNet2DConditionModel,
     EulerDiscreteScheduler
 )
+from diffusers.utils.torch_utils import randn_tensor
 from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file
 
@@ -56,7 +58,6 @@ unet_ckpt = "sdxl_lightning_4step_unet.safetensors" # Use the correct ckpt for y
 
 # controlnet_model = "diffusers/controlnet-canny-sdxl-1.0"
 controlnet_model = "diffusers/controlnet-depth-sdxl-1.0"
-
 
 
 # for depth estimation
@@ -100,6 +101,7 @@ class SDXL_Turbo(BaseTransformer):
         super().__init__(**kwargs)
         store_attr()
         self.generator = torch.Generator(device="cpu").manual_seed(SEED)
+        self.device = torch.device(self.device)
 
         # initialize the control net model
         controlnet = ControlNetModel.from_pretrained(
@@ -118,7 +120,7 @@ class SDXL_Turbo(BaseTransformer):
         unet_config = UNet2DConditionModel.load_config(model_id, subfolder="unet")
         unet = UNet2DConditionModel.from_config(unet_config).to("cuda", torch_dtype)
         unet.load_state_dict(load_file(hf_hub_download(unet_id, unet_ckpt), device="cuda"))
-        self.pipe = StableDiffusionXLControlNetImg2ImgPipeline.from_pretrained(
+        self.pipe = StableDiffusionXLControlNetPipeline.from_pretrained(
             model_id,
             safety_checker=None,
             use_safetensors=True,
@@ -139,6 +141,25 @@ class SDXL_Turbo(BaseTransformer):
         self.pipe.to(device=self.device, dtype=torch_dtype).to(self.device)
         if self.device != "mps":
             self.pipe.unet.to(memory_format=torch.channels_last)
+
+        self.latents = self.make_latents()
+
+
+    def make_latents(self):
+        # create uniform, shared latents
+        batch_size, num_images_per_prompt = 1, 1
+        batch_size *= num_images_per_prompt
+        num_channels_latents = self.pipe.unet.config.in_channels
+        shape = (batch_size, num_channels_latents, self.height // self.pipe.vae_scale_factor, self.width // self.pipe.vae_scale_factor)
+        latents = randn_tensor(shape, generator=self.generator, device=self.device, dtype=torch_dtype)
+        # print('local latents:', latents.shape, latents.dtype, latents.device, latents.max().item(), latents.min().item(), latents.mean().item())
+        return latents
+    
+    def refresh_latents(self):
+        self.latents = self.make_latents()
+
+    def get_latents(self):
+        return self.latents.clone()
 
     def _initialize_pipeline(self):
         pass
@@ -169,6 +190,8 @@ class SDXL_Turbo(BaseTransformer):
             height=self.height,
             output_type="pil",
             generator=self.generator,
+            # add the fixed, starting latents
+            latents=self.get_latents(),
         )
         result_image = results.images[0]
         return result_image
@@ -266,6 +289,20 @@ def set_prompt():
     return jsonify({"message": "Prompt set successfully"})
 
 
+@app.route('/refresh_prompt', methods=['POST'])
+def refresh_latents():
+    global image_transformer
+    try:
+        prompt = request.json.get('signal')  # Ensure we get the expected signal
+        if prompt != "refresh":  # Basic check for the correct signal
+            return jsonify({"error": "Invalid signal"}), 400
+        image_transformer.refresh_latents()  # Refresh the state as needed
+        return jsonify({"message": "Scene refreshed"})
+    except Exception as e:  # Catch potential errors and log them
+        print(f"Error refreshing scene: {e}")
+        return jsonify({"error": "Could not refresh scene"}), 500
+
+
 @app.route('/stream')
 def stream():
     def generate():
@@ -274,7 +311,7 @@ def stream():
         global image_transformer
         global previous_frame
 
-        cnt, decim = 0, 2
+        cnt, decim = 0, 1
         try:
             while True:
                 output_frame = transform_frame(
