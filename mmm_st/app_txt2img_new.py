@@ -9,52 +9,59 @@ from flask import Flask, jsonify, request, Response, render_template, send_file,
 from PIL import Image
 import torch
 import numpy as np
-import cv2  # Using OpenCV for video capture
+import cv2  
 from transformers import DPTImageProcessor, DPTForDepthEstimation
-from mmm_st.config import Config
+from mmm_st.config import Config as BaseConfig
 from mmm_st.diffuse import BaseTransformer
 from mmm_st.video import convert_to_pil_image
 from fastcore.basics import store_attr
 
-### Tests with SDXL turbo
+# tests with SDXL Lightning
 from diffusers import (
     StableDiffusionXLControlNetImg2ImgPipeline,
     ControlNetModel,
     AutoencoderKL,
-    AutoencoderTiny,
+    UNet2DConditionModel,
+    EulerDiscreteScheduler
 )
+from huggingface_hub import hf_hub_download
+from safetensors.torch import load_file
 
 app = Flask(__name__)
-
-SEED = Config.SEED
-torch.manual_seed(Config.SEED)
 
 # Import and use configurations from an external module if necessary
 class Config:
     HOST = '0.0.0.0'
     PORT = 8989
     CAP_PROPS = {'CAP_PROP_FPS': 30}
-    TRANSFORM_TYPE = "kandinsky"
     NUM_STEPS = 4
     HEIGHT = 1024
     WIDTH = 1024
+    SEED  = BaseConfig.SEED
 
 
 # Setup basic logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Set the seed and data type for torch
+SEED = Config.SEED
+torch.manual_seed(Config.SEED)
+torch_dtype = torch.float16
+
+# Models for image and controlnet
+model_id = "stabilityai/stable-diffusion-xl-base-1.0"
+unet_id = "ByteDance/SDXL-Lightning"
+unet_ckpt = "sdxl_lightning_4step_unet.safetensors" # Use the correct ckpt for your step setting!
 
 # controlnet_model = "diffusers/controlnet-canny-sdxl-1.0"
 controlnet_model = "diffusers/controlnet-depth-sdxl-1.0"
-model_id = "stabilityai/sdxl-turbo"
-taesd_model = "madebyollin/taesdxl"
 
-torch_dtype = torch.float16
 
+
+# for depth estimation
 depth_estimator = DPTForDepthEstimation.from_pretrained("Intel/dpt-hybrid-midas").to("cuda")
 feature_extractor = DPTImageProcessor.from_pretrained("Intel/dpt-hybrid-midas")
-
 
 def get_depth_map(image):
     image = feature_extractor(images=image, return_tensors="pt").pixel_values.to("cuda")
@@ -80,10 +87,10 @@ class SDXL_Turbo(BaseTransformer):
     def __init__(
             self,
             cfg=1.0,
-            strength=1.0,
+            strength=0.75,
             canny_low_threshold=100,
             canny_high_threshold=200,
-            controlnet_scale=0.8,
+            controlnet_scale=0.5,
             controlnet_start=0.0,
             controlnet_end=1.0,
             width=Config.WIDTH,
@@ -92,89 +99,77 @@ class SDXL_Turbo(BaseTransformer):
         ):
         super().__init__(**kwargs)
         store_attr()
-
         self.generator = torch.Generator(device="cpu").manual_seed(SEED)
-        controlnet_canny = ControlNetModel.from_pretrained(
+
+        # initialize the control net model
+        controlnet = ControlNetModel.from_pretrained(
             controlnet_model,
             torch_dtype=torch_dtype,
             use_safetensors=True,
         ).to(self.device)
+
+        # load in the VAE
         vae = AutoencoderKL.from_pretrained(
-            "madebyollin/sdxl-vae-fp16-fix", torch_dtype=torch_dtype
+            "madebyollin/sdxl-vae-fp16-fix",
+            torch_dtype=torch_dtype
         )
 
+        # Load the model with a controlnet.
+        unet_config = UNet2DConditionModel.load_config(model_id, subfolder="unet")
+        unet = UNet2DConditionModel.from_config(unet_config).to("cuda", torch_dtype)
+        unet.load_state_dict(load_file(hf_hub_download(unet_id, unet_ckpt), device="cuda"))
         self.pipe = StableDiffusionXLControlNetImg2ImgPipeline.from_pretrained(
             model_id,
             safety_checker=None,
             use_safetensors=True,
-            controlnet=controlnet_canny,
+            unet=unet,
             vae=vae,
+            # NOTE: try using the same contorlnet twice, with different strengths and images
+            controlnet=controlnet,
         )
 
+        # Ensure sampler uses "trailing" timesteps.
+        self.pipe.scheduler = EulerDiscreteScheduler.from_config(
+            self.pipe.scheduler.config,
+            timestep_spacing="trailing",
+        )
+
+        # final pipeline setup
         self.pipe.set_progress_bar_config(disable=True)
         self.pipe.to(device=self.device, dtype=torch_dtype).to(self.device)
         if self.device != "mps":
             self.pipe.unet.to(memory_format=torch.channels_last)
 
-        # if args.taesd:
-        # self.pipe.vae = AutoencoderTiny.from_pretrained(
-        #     taesd_model, torch_dtype=torch_dtype, use_safetensors=True
-        # ).to(self.device)
-
-        # if args.torch_compile:
-        #     self.pipe.unet = torch.compile(
-        #         self.pipe.unet, mode="reduce-overhead", fullgraph=True
-        #     )
-        #     self.pipe.vae = torch.compile(
-        #         self.pipe.vae, mode="reduce-overhead", fullgraph=True
-        #     )
-        #     self.pipe(
-        #         prompt="warmup",
-        #         image=[Image.new("RGB", (768, 768))],
-        #         control_image=[Image.new("RGB", (768, 768))],
-        #     )
-
     def _initialize_pipeline(self):
-        # raise NotImplementedError("Subclasses should implement this method.")
         pass
 
     def transform(self, image, prompt) -> Image.Image:
-        image = self.input_image or image
-        negative_prompt = self.negative_prompt
-        prompt_embeds = None
-        pooled_prompt_embeds = None
-        negative_prompt_embeds = None
-        negative_pooled_prompt_embeds = None
 
-        # control_image = self.canny_torch(
-        #     image, self.canny_low_threshold, self.canny_high_threshold
-        # )
+        # work on either the given image or the stored `input_image`
+        image = self.input_image or image
+
+        # get the controlnet image
         control_image = get_depth_map(image)
         steps = self.num_steps
         if int(steps * self.strength) < 1:
             steps = math.ceil(1 / max(0.10, self.strength))
 
+        # generate and return the image
         results = self.pipe(
-            image=image,
-            control_image=control_image,
             prompt=prompt,
-            negative_prompt=negative_prompt,
-            prompt_embeds=prompt_embeds,
-            pooled_prompt_embeds=pooled_prompt_embeds,
-            negative_prompt_embeds=negative_prompt_embeds,
-            negative_pooled_prompt_embeds=negative_pooled_prompt_embeds,
-            generator=self.generator,
-            strength=self.strength,
+            negative_prompt=self.negative_prompt,
+            image=control_image,
             num_inference_steps=steps,
             guidance_scale=self.cfg,
-            width=self.width,
-            height=self.height,
-            output_type="pil",
+            strength=self.strength,
             controlnet_conditioning_scale=self.controlnet_scale,
             control_guidance_start=self.controlnet_start,
             control_guidance_end=self.controlnet_end,
+            width=self.width,
+            height=self.height,
+            output_type="pil",
+            generator=self.generator,
         )
-
         result_image = results.images[0]
         return result_image
 
@@ -279,7 +274,7 @@ def stream():
         global image_transformer
         global previous_frame
 
-        cnt, decim = 0, 3
+        cnt, decim = 0, 2
         try:
             while True:
                 output_frame = transform_frame(
@@ -291,9 +286,12 @@ def stream():
 
                 # # set the new image as the previous, to condition on
                 # image_transformer.set_image(previous_frame)
+
                 if cnt == decim:
                     img_byte_arr = BytesIO()
                     pil_image = convert_to_pil_image(output_frame)
+                    # rescale to better fit the image
+                    pil_image = pil_image.resize((1920, 1080))
                     pil_image.save(img_byte_arr, format='JPEG')
                     img_byte_arr.seek(0)
                     encoded_img = base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')

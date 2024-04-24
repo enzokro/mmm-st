@@ -15,81 +15,21 @@ from mmm_st.config import Config
 from mmm_st.diffuse import BaseTransformer
 from mmm_st.video import convert_to_pil_image
 from fastcore.basics import store_attr
-import matplotlib
-import matplotlib.cm
 
-
-torch.hub.help("intel-isl/MiDaS", "DPT_BEiT_L_384", force_reload=True)  # Triggers fresh download of MiDaS repo
-model_zoe_n = torch.hub.load("isl-org/ZoeDepth", "ZoeD_NK", pretrained=True).eval()
-model_zoe_n = model_zoe_n.to("cuda")
-
-
-def colorize(value, vmin=None, vmax=None, cmap='gray_r', invalid_val=-99, invalid_mask=None, background_color=(128, 128, 128, 255), gamma_corrected=False, value_transform=None):
-    if isinstance(value, torch.Tensor):
-        value = value.detach().cpu().numpy()
-
-    value = value.squeeze()
-    if invalid_mask is None:
-        invalid_mask = value == invalid_val
-    mask = np.logical_not(invalid_mask)
-
-    # normalize
-    vmin = np.percentile(value[mask],2) if vmin is None else vmin
-    vmax = np.percentile(value[mask],85) if vmax is None else vmax
-    if vmin != vmax:
-        value = (value - vmin) / (vmax - vmin)  # vmin..vmax
-    else:
-        # Avoid 0-division
-        value = value * 0.
-
-    # squeeze last dim if it exists
-    # grey out the invalid values
-
-    value[invalid_mask] = np.nan
-    cmapper = matplotlib.cm.get_cmap(cmap)
-    if value_transform:
-        value = value_transform(value)
-        # value = value / value.max()
-    value = cmapper(value, bytes=True)  # (nxmx4)
-
-    # img = value[:, :, :]
-    img = value[...]
-    img[invalid_mask] = background_color
-
-    # gamma correction
-    img = img / 255
-    img = np.power(img, 2.2)
-    img = img * 255
-    img = img.astype(np.uint8)
-    img = Image.fromarray(img)
-    return img
-
-
-def get_zoe_depth_map(image):
-    with torch.autocast("cuda", enabled=True):
-        depth = model_zoe_n.infer_pil(image)
-    depth = colorize(depth, cmap="gray_r")
-    return depth
-
-### Tests with SDXL turbo
+# Tests with SDXL turbo
 from diffusers import (
-    StableDiffusionXLControlNetImg2ImgPipeline,
+    StableDiffusionXLControlNetPipeline,
     ControlNetModel,
     AutoencoderKL,
-    AutoencoderTiny,
 )
 
 app = Flask(__name__)
-
-SEED = Config.SEED
-torch.manual_seed(Config.SEED)
 
 # Import and use configurations from an external module if necessary
 class Config:
     HOST = '0.0.0.0'
     PORT = 8989
     CAP_PROPS = {'CAP_PROP_FPS': 30}
-    TRANSFORM_TYPE = "kandinsky"
     NUM_STEPS = 4
     HEIGHT = 1024
     WIDTH = 1024
@@ -99,18 +39,21 @@ class Config:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Set the seed and data type for torch
+SEED = Config.SEED
+torch.manual_seed(Config.SEED)
+torch_dtype = torch.float16
 
+# Models for image and controlnet
 # controlnet_model = "diffusers/controlnet-canny-sdxl-1.0"
-# controlnet_model = "diffusers/controlnet-depth-sdxl-1.0"
-controlnet_model = "diffusers/controlnet-zoe-depth-sdxl-1.0"
+controlnet_model = "diffusers/controlnet-depth-sdxl-1.0"
 model_id = "stabilityai/sdxl-turbo"
 taesd_model = "madebyollin/taesdxl"
 
-torch_dtype = torch.float16
 
+# for depth estimation
 depth_estimator = DPTForDepthEstimation.from_pretrained("Intel/dpt-hybrid-midas").to("cuda")
 feature_extractor = DPTImageProcessor.from_pretrained("Intel/dpt-hybrid-midas")
-
 
 def get_depth_map(image):
     image = feature_extractor(images=image, return_tensors="pt").pixel_values.to("cuda")
@@ -135,7 +78,7 @@ def get_depth_map(image):
 class SDXL_Turbo(BaseTransformer):
     def __init__(
             self,
-            cfg=1.5,
+            cfg=1.0,
             strength=1.0,
             canny_low_threshold=100,
             canny_high_threshold=200,
@@ -150,7 +93,7 @@ class SDXL_Turbo(BaseTransformer):
         store_attr()
 
         self.generator = torch.Generator(device="cpu").manual_seed(SEED)
-        controlnet_canny = ControlNetModel.from_pretrained(
+        controlnet = ControlNetModel.from_pretrained(
             controlnet_model,
             torch_dtype=torch_dtype,
             use_safetensors=True,
@@ -159,11 +102,10 @@ class SDXL_Turbo(BaseTransformer):
             "madebyollin/sdxl-vae-fp16-fix", torch_dtype=torch_dtype
         )
 
-        self.pipe = StableDiffusionXLControlNetImg2ImgPipeline.from_pretrained(
+        self.pipe = StableDiffusionXLControlNetPipeline.from_pretrained(
             model_id,
-            safety_checker=None,
             use_safetensors=True,
-            controlnet=controlnet_canny,
+            controlnet=controlnet,
             vae=vae,
         )
 
@@ -172,26 +114,7 @@ class SDXL_Turbo(BaseTransformer):
         if self.device != "mps":
             self.pipe.unet.to(memory_format=torch.channels_last)
 
-        # if args.taesd:
-        # self.pipe.vae = AutoencoderTiny.from_pretrained(
-        #     taesd_model, torch_dtype=torch_dtype, use_safetensors=True
-        # ).to(self.device)
-
-        # if args.torch_compile:
-        #     self.pipe.unet = torch.compile(
-        #         self.pipe.unet, mode="reduce-overhead", fullgraph=True
-        #     )
-        #     self.pipe.vae = torch.compile(
-        #         self.pipe.vae, mode="reduce-overhead", fullgraph=True
-        #     )
-        #     self.pipe(
-        #         prompt="warmup",
-        #         image=[Image.new("RGB", (768, 768))],
-        #         control_image=[Image.new("RGB", (768, 768))],
-        #     )
-
     def _initialize_pipeline(self):
-        # raise NotImplementedError("Subclasses should implement this method.")
         pass
 
     def transform(self, image, prompt) -> Image.Image:
@@ -202,11 +125,7 @@ class SDXL_Turbo(BaseTransformer):
         negative_prompt_embeds = None
         negative_pooled_prompt_embeds = None
 
-        # control_image = self.canny_torch(
-        #     image, self.canny_low_threshold, self.canny_high_threshold
-        # )
-        # control_image = get_depth_map(image)
-        control_image = get_zoe_depth_map(image).resize((self.width, self.height))
+        control_image = get_depth_map(image)
         steps = self.num_steps
         if int(steps * self.strength) < 1:
             steps = math.ceil(1 / max(0.10, self.strength))
@@ -336,6 +255,7 @@ def stream():
         global image_transformer
         global previous_frame
 
+        cnt, decim = 0, 2
         try:
             while True:
                 output_frame = transform_frame(
@@ -343,16 +263,22 @@ def stream():
                     prompt=current_prompt)
                 previous_frame = output_frame
 
+                cnt += 1
+
                 # # set the new image as the previous, to condition on
                 # image_transformer.set_image(previous_frame)
-                
-                img_byte_arr = BytesIO()
-                pil_image = convert_to_pil_image(output_frame)
-                pil_image.save(img_byte_arr, format='JPEG')
-                img_byte_arr.seek(0)
-                encoded_img = base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
-                yield f"data: {encoded_img}\n\n"
-                time.sleep(1 / 30)  # Control frame rate
+
+                if cnt == decim:
+                    img_byte_arr = BytesIO()
+                    pil_image = convert_to_pil_image(output_frame)
+                    # rescale to better fit the image
+                    pil_image = pil_image.resize((1920, 1080))
+                    pil_image.save(img_byte_arr, format='JPEG')
+                    img_byte_arr.seek(0)
+                    encoded_img = base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
+                    yield f"data: {encoded_img}\n\n"
+                    cnt = 0
+                # time.sleep(1 / 15)  # Control frame rate
         finally:
             video_streamer.release()
 
