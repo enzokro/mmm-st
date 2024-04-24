@@ -122,7 +122,6 @@ class SDXL_Turbo(BaseTransformer):
         unet.load_state_dict(load_file(hf_hub_download(unet_id, unet_ckpt), device="cuda"))
         self.pipe = StableDiffusionXLControlNetPipeline.from_pretrained(
             model_id,
-            safety_checker=None,
             use_safetensors=True,
             unet=unet,
             vae=vae,
@@ -256,11 +255,11 @@ def transform_frame(previous_frame, prompt=None):
     else:
         transformed_image = current_frame
 
-    # # Interpolate between the previous frame and the transformed image
-    # if previous_frame is not None:
-    #     output_frame = interpolate_images(previous_frame, transformed_image, alpha=0.5)
-    # else:
-    #     output_frame = transformed_image
+    # Interpolate between the previous frame and the transformed image
+    if previous_frame is not None:
+        output_frame = interpolate_images(previous_frame, transformed_image, alpha=0.75)
+    else:
+        output_frame = transformed_image
 
     output_frame = transformed_image
 
