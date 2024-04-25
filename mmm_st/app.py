@@ -21,6 +21,7 @@ from diffusers import (
     EulerDiscreteScheduler,
 )
 from diffusers.utils.torch_utils import randn_tensor
+from controlnet_aux import OpenposeDetector
 from transformers import DPTImageProcessor, DPTForDepthEstimation
 from huggingface_hub import hf_hub_download
 from flask import Flask, jsonify, request, Response, render_template, stream_with_context
@@ -60,7 +61,8 @@ class Config:
     MODEL_ID = "stabilityai/stable-diffusion-xl-base-1.0"
     UNET_ID = "ByteDance/SDXL-Lightning"
     UNET_CKPT = "sdxl_lightning_4step_unet.safetensors"
-    CONTROLNET = "diffusers/controlnet-depth-sdxl-1.0"
+    CONTROLNET_DEPTH = "diffusers/controlnet-depth-sdxl-1.0"
+    CONTROLNET_POSE = "thibaud/controlnet-openpose-sdxl-1.0"
 
     # Default data type for torch
     DTYPE = torch.float16
@@ -186,27 +188,38 @@ class SDXL(BaseTransformer):
 
     def _initialize_pipeline(self):
 
-        # initialize the control net model
-        controlnet = ControlNetModel.from_pretrained(
-            Config.CONTROLNET,
+        # initialize the depth control net model
+        controlnet_depth = ControlNetModel.from_pretrained(
+            Config.CONTROLNET_DEPTH,
             torch_dtype=self.dtype,
             use_safetensors=True,
         ).to(self.device)
+        # initialize the post control net model
+        controlnet_pose = ControlNetModel.from_pretrained(
+            Config.CONTROLNET_POSE,
+            torch_dtype=self.dtype,
+            use_safetensors=True,
+        ).to(self.device)   
 
         # for depth estimation
         self.depth_estimator = DPTForDepthEstimation.from_pretrained("Intel/dpt-hybrid-midas").to(self.device)
         self.feature_extractor = DPTImageProcessor.from_pretrained("Intel/dpt-hybrid-midas")
 
-        # load in the VAE
-        vae = AutoencoderKL.from_pretrained(
-            "madebyollin/sdxl-vae-fp16-fix",
-            torch_dtype=self.dtype
-        )
+        # for post estimation
+        self.openpose = OpenposeDetector.from_pretrained("lllyasviel/ControlNet").to(self.device)
 
         # Load the Lightning UNet
         unet_config = UNet2DConditionModel.load_config(Config.MODEL_ID, subfolder="unet")
         unet = UNet2DConditionModel.from_config(unet_config).to(self.device, self.dtype)
-        unet.load_state_dict(load_file(hf_hub_download(Config.UNET_ID, Config.UNET_CKPT), device=self.device))
+        unet.load_state_dict(
+            load_file(hf_hub_download(Config.UNET_ID, Config.UNET_CKPT), device=self.device)
+        )
+
+        # load in the fixed VAE
+        vae = AutoencoderKL.from_pretrained(
+            "madebyollin/sdxl-vae-fp16-fix",
+            torch_dtype=self.dtype
+        )
         
         # Load the model with a controlnet.
         self.pipe = StableDiffusionXLControlNetPipeline.from_pretrained(
@@ -215,7 +228,7 @@ class SDXL(BaseTransformer):
             unet=unet,
             vae=vae,
             # NOTE: try using the same contorlnet twice, with different strengths and images
-            controlnet=controlnet,
+            controlnet=[controlnet_depth, controlnet_pose],
         )
 
         # Ensure sampler uses "trailing" timesteps.
@@ -257,8 +270,14 @@ class SDXL(BaseTransformer):
         Uses a controlnet to condition and manage the generation. 
         """
 
-        # get the controlnet image
-        control_image = self.get_depth_map(image)
+        # get the controlnet depth image
+        depth_image = self.get_depth_map(image)
+
+        # get the controlnet pose image
+        pose_image = self.openpose(image)
+        pose_image = pose_image.resize((self.width, self.height))
+
+        # compute the number of steps
         steps = self.num_steps
         if int(steps * self.strength) < 1:
             steps = math.ceil(1 / max(0.10, self.strength))
@@ -267,11 +286,11 @@ class SDXL(BaseTransformer):
         results = self.pipe(
             prompt=prompt,
             negative_prompt=self.negative_prompt,
-            image=control_image,
+            image=[pose_image, depth_image],
+            controlnet_conditioning_scale=[self.controlnet_scale, self.controlnet_scale],
             num_inference_steps=steps,
             guidance_scale=self.cfg,
             strength=self.strength,
-            controlnet_conditioning_scale=self.controlnet_scale,
             control_guidance_start=self.controlnet_start,
             control_guidance_end=self.controlnet_end,
             width=self.width,
@@ -387,6 +406,7 @@ def stream():
 def cleanup():
     shared_resources.stop_event.set() 
     video_thread.join() 
+    del shared_resources
     gc.collect()  
     torch.cuda.empty_cache()  
 
