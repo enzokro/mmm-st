@@ -7,12 +7,13 @@ import logging
 import threading
 from io import BytesIO
 from queue import Queue
+from PIL import Image
 import numpy as np
 import torch
 import cv2
-from PIL import Image
 from fastcore.basics import store_attr
 from safetensors.torch import load_file
+from huggingface_hub import hf_hub_download
 from diffusers import (
     StableDiffusionXLControlNetPipeline,
     ControlNetModel,
@@ -23,7 +24,6 @@ from diffusers import (
 from diffusers.utils.torch_utils import randn_tensor
 from controlnet_aux import OpenposeDetector
 from transformers import DPTImageProcessor, DPTForDepthEstimation
-from huggingface_hub import hf_hub_download
 from flask import Flask, jsonify, request, Response, render_template, stream_with_context
 # from flask_socketio import SocketIO, emit
 from mmm_st.config import Config as BaseConfig
@@ -81,17 +81,17 @@ class SharedResources:
         )
         self.current_frame = None
         self.current_prompt = None
-        self.lock = threading.Lock()  # Ensure thread-safe access
-        self.stop_event = threading.Event()  # Signal to stop thread
-        self.frame_queue = Queue()  # Queue for frame streaming
+        self.lock = threading.Lock() 
+        self.stop_event = threading.Event() 
+        self.frame_queue = Queue() 
 
     def update_frame(self, frame):
         with self.lock:
             self.current_frame = frame
-            self.frame_queue.put(frame)  # Add frame to queue
+            self.frame_queue.put(frame) 
 
     def get_frame(self):
-        return self.frame_queue.get()  # Get the latest frame from queue
+        return self.frame_queue.get()
 
     def update_prompt(self, prompt):
         with self.lock:
@@ -103,7 +103,7 @@ class SharedResources:
 
 
 class VideoStreamer:
-    "Continuously reads frames from a video capture source."
+    "Reads frames from a video capture source."
     def __init__(self, device_path='/dev/video0'):
         self.cap = cv2.VideoCapture(device_path)
         if not self.cap.isOpened():
@@ -122,6 +122,13 @@ class VideoStreamer:
         self.cap.release()
 
 
+def interpolate_images(image1, image2, alpha=0.5):
+    """ Interpolates two images with a given alpha blending factor. """
+    if image1.size != image2.size:
+        image2 = image2.resize(image1.size)
+    return Image.blend(image1, image2, alpha)
+       
+       
 # Video processing class that handles the transformation and streaming
 class VideoProcessingThread(threading.Thread):
     def __init__(self, shared_resources, device_path=Config.VIDEO_PATH):
@@ -132,11 +139,6 @@ class VideoProcessingThread(threading.Thread):
         self.stop_event = shared_resources.stop_event
 
     def run(self):
-        def interpolate_images(image1, image2, alpha=0.5):
-            """ Interpolates two images with a given alpha blending factor. """
-            if image1.size != image2.size:
-                image2 = image2.resize(image1.size)
-            return Image.blend(image1, image2, alpha)
 
         while not self.stop_event.is_set():
             current_frame = self.video_streamer.get_current_frame()
@@ -163,7 +165,7 @@ class VideoProcessingThread(threading.Thread):
             # final sanity break
             if self.stop_event.is_set(): break
 
-        self.video_streamer.release()  # Release resources when stopping
+        self.video_streamer.release() 
 
 
 class SDXL(BaseTransformer):
@@ -205,7 +207,7 @@ class SDXL(BaseTransformer):
         self.depth_estimator = DPTForDepthEstimation.from_pretrained("Intel/dpt-hybrid-midas").to(self.device)
         self.feature_extractor = DPTImageProcessor.from_pretrained("Intel/dpt-hybrid-midas")
 
-        # for post estimation
+        # for pose estimation
         self.openpose = OpenposeDetector.from_pretrained("lllyasviel/ControlNet").to(self.device)
 
         # Load the Lightning UNet
@@ -244,16 +246,16 @@ class SDXL(BaseTransformer):
             self.pipe.unet.to(memory_format=torch.channels_last)
 
         # start with a fixed set of latents
+        batch_size, num_images_per_prompt = 1, 1
+        batch_size *= num_images_per_prompt
+        num_channels_latents = self.pipe.unet.config.in_channels
+        self.latents_shape = (batch_size, num_channels_latents, self.height // self.pipe.vae_scale_factor, self.width // self.pipe.vae_scale_factor)
         self.latents = self._make_latents()
 
 
     def _make_latents(self):
         "Create a fixed set of latents for reproducible starting images."
-        batch_size, num_images_per_prompt = 1, 1
-        batch_size *= num_images_per_prompt
-        num_channels_latents = self.pipe.unet.config.in_channels
-        shape = (batch_size, num_channels_latents, self.height // self.pipe.vae_scale_factor, self.width // self.pipe.vae_scale_factor)
-        latents = randn_tensor(shape, generator=self.generator, device=self.device, dtype=self.dtype)
+        latents = randn_tensor(self.latents_shape, generator=self.generator, device=self.device, dtype=self.dtype)
         return latents
     
     def refresh_latents(self):
@@ -274,7 +276,8 @@ class SDXL(BaseTransformer):
         depth_image = self.get_depth_map(image)
 
         # get the controlnet pose image
-        pose_image = self.openpose(image)
+        with torch.no_grad(), torch.autocast(self.device):
+            pose_image = self.openpose(image)
         pose_image = pose_image.resize((self.width, self.height))
 
         # compute the number of steps
@@ -371,8 +374,8 @@ def stream():
         while not shared_resources.stop_event.is_set():
             frame = shared_resources.get_frame()
             if frame is not None:
-                frame = convert_to_pil_image(frame)
                 # rescale to better fit the image
+                frame = convert_to_pil_image(frame)
                 frame = frame.resize((Config.DISPLAY_WIDTH, Config.DISPLAY_HEIGHT))
                 img_byte_arr = BytesIO()
                 frame.save(img_byte_arr, format='JPEG')
@@ -410,7 +413,7 @@ def cleanup():
     gc.collect()  
     torch.cuda.empty_cache()  
 
-# Register cleanup function at exit
+# Register cleanup 
 atexit.register(cleanup)
 
 if __name__ == "__main__":
