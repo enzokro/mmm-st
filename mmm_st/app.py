@@ -307,7 +307,7 @@ class SDXL(BaseTransformer):
 
 # Initialize shared resources and video processing thread
 shared_resources = SharedResources()
-video_thread = VideoProcessingThread(shared_resources)
+video_thread = VideoProcessingThread(shared_resources, device_path=Config.VIDEO_PATH)
 video_thread.start()
 
 
