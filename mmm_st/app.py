@@ -42,13 +42,6 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# maps from name to scheduler 
-name2sched = {
-    'ddpm': DDPMScheduler,
-    'ddim': DDIMScheduler,
-    'euler': EulerDiscreteScheduler,
-    'ddpm2': KDPM2DiscreteScheduler,
-}
 
 # parameters for the run
 class Config:
@@ -89,11 +82,19 @@ class Config:
 # fix the seed for reproducibility
 torch.manual_seed(Config.SEED)
 
+# map from name to scheduler 
+name2sched = {
+    'ddpm':  DDPMScheduler,
+    'ddim':  DDIMScheduler,
+    'euler': EulerDiscreteScheduler,
+    'ddpm2': KDPM2DiscreteScheduler,
+}
+
 
 class SharedResources:
     """Manages shared resources.
     
-    Creates:
+    Creates the following:
         - Stable Diffusion pipeline
         - Current input prompt
         - Current generated frame
@@ -151,18 +152,12 @@ class VideoStreamer:
     def release(self):
         self.cap.release()
 
+
 def interpolate_images(image1, image2, alpha=0.5):
     """Interpolate two images with a given `alpha` blending factor.
     
     output = (1 - alpha) * image1 + (alpha * image2)
     """
-    if image1.size != image2.size:
-        image2 = image2.resize(image1.size)
-    return Image.blend(image1, image2, alpha)
-
-
-def interpolate_images(image1, image2, alpha=0.5):
-    """ Interpolates two images with a given alpha blending factor. """
     if image1.size != image2.size:
         image2 = image2.resize(image1.size)
     return Image.blend(image1, image2, alpha)
@@ -229,7 +224,7 @@ class SDXL(BaseTransformer):
             strength=0.75,
             canny_low_threshold=100,
             canny_high_threshold=200,
-            controlnet_scale=0.5,
+            controlnet_scale=[0.5, 0.5],
             controlnet_start=0.0,
             controlnet_end=1.0,
             width=Config.WIDTH,
@@ -332,8 +327,7 @@ class SDXL(BaseTransformer):
             prompt=prompt,
             negative_prompt=self.negative_prompt,
             image=[depth_image, pose_image],
-            controlnet_conditioning_scale=[0.5, 0.5],
-            # controlnet_conditioning_scale=[self.controlnet_scale, self.controlnet_scale],
+            controlnet_conditioning_scale=[self.controlnet_scale, self.controlnet_scale],
             num_inference_steps=steps,
             guidance_scale=self.cfg,
             strength=self.strength,
