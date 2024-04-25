@@ -19,11 +19,12 @@ from diffusers import (
     ControlNetModel,
     AutoencoderKL,
     UNet2DConditionModel,
-    EulerDiscreteScheduler,
 )
+from diffusers import EulerDiscreteScheduler, DDIMScheduler, DDPMScheduler, KDPM2DiscreteScheduler
 from diffusers.utils.torch_utils import randn_tensor
-from controlnet_aux import OpenposeDetector
 from transformers import DPTImageProcessor, DPTForDepthEstimation
+from controlnet_aux import OpenposeDetector
+from huggingface_hub import hf_hub_download
 from flask import Flask, jsonify, request, Response, render_template, stream_with_context
 # from flask_socketio import SocketIO, emit
 from mmm_st.config import Config as BaseConfig
@@ -33,46 +34,72 @@ from mmm_st.video import convert_to_pil_image
 
 # Create Flask app
 app = Flask(__name__)
+
+# TODO: switch stream to web socket
 # socketio = SocketIO(app, async_mode="eventlet", cors_allowed_origins="*")
 
-# Basic logging configuration
+# setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Application configuration
+# maps from name to scheduler 
+name2sched = {
+    'ddpm': DDPMScheduler,
+    'ddim': DDIMScheduler,
+    'euler': EulerDiscreteScheduler,
+    'ddpm2': KDPM2DiscreteScheduler,
+}
+
+# parameters for the run
 class Config:
+
+    # basic app params
     HOST = '0.0.0.0'
     PORT = 8989
+    SEED  = BaseConfig.SEED
+    VIDEO_PATH = '/dev/video0'
     CAP_PROPS = {}
+
+    # for the denoised image
     NUM_STEPS = 4
     HEIGHT = 1024
     WIDTH = 1024
-    SEED  = BaseConfig.SEED
-    VIDEO_PATH = '/dev/video0'
 
-    # to display the final output frame on stream
+    # size of the final image sent over
     DISPLAY_WIDTH = 1920
     DISPLAY_HEIGHT = 1080
 
     # alpha blending factor for frame interpolation
     FRAME_BLEND = 0.75
 
-    # Models for image and controlnet
+    # default data type for torch
+    DTYPE = torch.float16
+
+    # models for denoising, and controlnet
     MODEL_ID = "stabilityai/stable-diffusion-xl-base-1.0"
     UNET_ID = "ByteDance/SDXL-Lightning"
     UNET_CKPT = "sdxl_lightning_4step_unet.safetensors"
     CONTROLNET_DEPTH = "diffusers/controlnet-depth-sdxl-1.0"
     CONTROLNET_POSE = "thibaud/controlnet-openpose-sdxl-1.0"
+    
+    # scheduler type
+    SCHEDULER = 'ddpm2'
 
-    # Default data type for torch
-    DTYPE = torch.float16
 
-# Ensure torch uses the correct seed
+# fix the seed for reproducibility
 torch.manual_seed(Config.SEED)
 
 
-# Class for managing shared resources
 class SharedResources:
+    """Manages shared resources.
+    
+    Creates:
+        - Stable Diffusion pipeline
+        - Current input prompt
+        - Current generated frame
+
+    Uses locks, events, and queues for concurrency.
+    """
     def __init__(self):
         self.image_transformer = SDXL(
             num_steps=Config.NUM_STEPS,
@@ -86,6 +113,7 @@ class SharedResources:
         self.frame_queue = Queue() 
 
     def update_frame(self, frame):
+        "Places a new `frame` in the queue."
         with self.lock:
             self.current_frame = frame
             self.frame_queue.put(frame) 
@@ -94,17 +122,19 @@ class SharedResources:
         return self.frame_queue.get()
 
     def update_prompt(self, prompt):
+        "Updates the generation prompt."
         with self.lock:
             self.current_prompt = prompt
 
     def get_prompt(self):
+        "Gets the current generation prompt."
         with self.lock:
             return self.current_prompt
 
 
 class VideoStreamer:
     "Reads frames from a video capture source."
-    def __init__(self, device_path='/dev/video0'):
+    def __init__(self, device_path: str):
         self.cap = cv2.VideoCapture(device_path)
         if not self.cap.isOpened():
             logger.error("Failed to open video source")
@@ -121,6 +151,15 @@ class VideoStreamer:
     def release(self):
         self.cap.release()
 
+def interpolate_images(image1, image2, alpha=0.5):
+    """Interpolate two images with a given `alpha` blending factor.
+    
+    output = (1 - alpha) * image1 + (alpha * image2)
+    """
+    if image1.size != image2.size:
+        image2 = image2.resize(image1.size)
+    return Image.blend(image1, image2, alpha)
+
 
 def interpolate_images(image1, image2, alpha=0.5):
     """ Interpolates two images with a given alpha blending factor. """
@@ -131,44 +170,59 @@ def interpolate_images(image1, image2, alpha=0.5):
        
 # Video processing class that handles the transformation and streaming
 class VideoProcessingThread(threading.Thread):
+    "Background thread for video processing."
     def __init__(self, shared_resources, device_path=Config.VIDEO_PATH):
         super().__init__(daemon=True)
         self.shared_resources = shared_resources
-        self.video_streamer = VideoStreamer(device_path)
-        self.previous_frame = None
         self.stop_event = shared_resources.stop_event
 
-    def run(self):
+        # create the video streamer
+        self.video_streamer = VideoStreamer(device_path)
+        self.previous_frame = None
 
+    def run(self):
+        "Continuously transforms input video frames."
         while not self.stop_event.is_set():
+
+            # grab the current frame
             current_frame = self.video_streamer.get_current_frame()
             if current_frame is None:
                 continue
-
+            
+            # grab the current prompt
             current_prompt = self.shared_resources.get_prompt()
 
-            # Apply transformation based on the current prompt
+            # transform the current frame
             transformed_frame = self.shared_resources.image_transformer.transform(
                 current_frame,
                 current_prompt,
             )
 
-            # Interpolate and update the shared frame
+            # interpolate it with the previous frame 
             if self.previous_frame is not None:
                 final_frame = interpolate_images(self.previous_frame, transformed_frame, Config.FRAME_BLEND)
             else:
                 final_frame = transformed_frame
 
+            # update the final frames
             self.shared_resources.update_frame(final_frame)
             self.previous_frame = final_frame
 
-            # final sanity break
+            # sanity check for stopping
             if self.stop_event.is_set(): break
 
-        self.video_streamer.release() 
+        # at the end, release the video source
+        self.video_streamer.release()
 
 
 class SDXL(BaseTransformer):
+    """Uses an SDXL model with ControlNet to generate images.
+    
+    The pipeline uses the 4-step UNet from SDXL-Lightning for faster generations.
+    It uses two ControlNet modules:
+        - One for depth
+        - Another for pose
+    """
     def __init__(
             self,
             cfg=1.0,
@@ -181,6 +235,7 @@ class SDXL(BaseTransformer):
             width=Config.WIDTH,
             height=Config.HEIGHT,
             dtype=Config.DTYPE,
+            scheduler=Config.SCHEDULER,
             **kwargs,
         ):
         store_attr()
@@ -189,28 +244,30 @@ class SDXL(BaseTransformer):
         super().__init__(**kwargs)
 
     def _initialize_pipeline(self):
+        "Sets up the pipeline."
 
-        # initialize the depth control net model
+        # initialize the depth control net
         controlnet_depth = ControlNetModel.from_pretrained(
             Config.CONTROLNET_DEPTH,
             torch_dtype=self.dtype,
             use_safetensors=True,
         ).to(self.device)
-        # initialize the post control net model
+
+        # initialize the pose control net
         controlnet_pose = ControlNetModel.from_pretrained(
             Config.CONTROLNET_POSE,
             torch_dtype=self.dtype,
             use_safetensors=True,
         ).to(self.device)   
 
-        # for depth estimation
+        # model for depth estimation
         self.depth_estimator = DPTForDepthEstimation.from_pretrained("Intel/dpt-hybrid-midas").to(self.device)
         self.feature_extractor = DPTImageProcessor.from_pretrained("Intel/dpt-hybrid-midas")
 
-        # for pose estimation
+        # model for pose estimation
         self.openpose = OpenposeDetector.from_pretrained("lllyasviel/ControlNet").to(self.device)
 
-        # Load the Lightning UNet
+        # load the Lightning UNet
         unet_config = UNet2DConditionModel.load_config(Config.MODEL_ID, subfolder="unet")
         unet = UNet2DConditionModel.from_config(unet_config).to(self.device, self.dtype)
         unet.load_state_dict(
@@ -223,7 +280,7 @@ class SDXL(BaseTransformer):
             torch_dtype=self.dtype
         )
         
-        # Load the model with a controlnet.
+        # load the model with controlnets.
         self.pipe = StableDiffusionXLControlNetPipeline.from_pretrained(
             Config.MODEL_ID,
             use_safetensors=True,
@@ -233,8 +290,9 @@ class SDXL(BaseTransformer):
             controlnet=[controlnet_depth, controlnet_pose],
         )
 
-        # Ensure sampler uses "trailing" timesteps.
-        self.pipe.scheduler = EulerDiscreteScheduler.from_config(
+        # sampler with trailing timesteps per the docs
+        # self.pipe.scheduler = EulerDiscreteScheduler.from_config(
+        self.pipe.scheduler = name2sched[self.scheduler].from_config(
             self.pipe.scheduler.config,
             timestep_spacing="trailing",
         )
@@ -250,21 +308,7 @@ class SDXL(BaseTransformer):
         batch_size *= num_images_per_prompt
         num_channels_latents = self.pipe.unet.config.in_channels
         self.latents_shape = (batch_size, num_channels_latents, self.height // self.pipe.vae_scale_factor, self.width // self.pipe.vae_scale_factor)
-        self.latents = self._make_latents()
-
-
-    def _make_latents(self):
-        "Create a fixed set of latents for reproducible starting images."
-        latents = randn_tensor(self.latents_shape, generator=self.generator, device=self.device, dtype=self.dtype)
-        return latents
-    
-    def refresh_latents(self):
-        "Grabs a new set of latents to refresh the starting image generation."
-        self.latents = self._make_latents()
-
-    def get_latents(self):
-        "Returns a copy of the current latents, to prevent them from being overriden."
-        return self.latents.clone()
+        self.latents = self.refresh_latents()
 
     def transform(self, image, prompt) -> Image.Image:
         """Transforms the given `image` based on the `prompt`.
@@ -276,9 +320,7 @@ class SDXL(BaseTransformer):
         depth_image = self.get_depth_map(image)
 
         # get the controlnet pose image
-        with torch.no_grad(), torch.autocast(self.device):
-            pose_image = self.openpose(image)
-        pose_image = pose_image.resize((self.width, self.height))
+        pose_image = self.get_pose_map(image)
 
         # compute the number of steps
         steps = self.num_steps
@@ -289,8 +331,9 @@ class SDXL(BaseTransformer):
         results = self.pipe(
             prompt=prompt,
             negative_prompt=self.negative_prompt,
-            image=[pose_image, depth_image],
-            controlnet_conditioning_scale=[self.controlnet_scale, self.controlnet_scale],
+            image=[depth_image, pose_image],
+            controlnet_conditioning_scale=[0.5, 0.5],
+            # controlnet_conditioning_scale=[self.controlnet_scale, self.controlnet_scale],
             num_inference_steps=steps,
             guidance_scale=self.cfg,
             strength=self.strength,
@@ -307,6 +350,7 @@ class SDXL(BaseTransformer):
         return result_image
     
     def get_depth_map(self, image):
+        "Builds the controlnet depth map."
         image = self.feature_extractor(images=image, return_tensors="pt").pixel_values.to(self.device)
         with torch.no_grad(), torch.autocast(self.device):
             depth_map = self.depth_estimator(image).predicted_depth
@@ -326,8 +370,24 @@ class SDXL(BaseTransformer):
         image = Image.fromarray((image * 255.0).clip(0, 255).astype(np.uint8))
         return image
     
+    def get_pose_map(self, image):
+        "Builds the controlnet pose map."
+        with torch.no_grad(), torch.autocast(self.device):
+            pose_image = self.openpose(image)
+        pose_image = pose_image.resize((self.width, self.height))
+        return pose_image
+    
+    def get_latents(self):
+        "Returns a copy of the current latents, to prevent them from being overriden."
+        return self.latents.clone()
 
-# Initialize shared resources and video processing thread
+    def refresh_latents(self):
+        "Creates a fixed set of latents for ~reproducible images."
+        latents = randn_tensor(self.latents_shape, generator=self.generator, device=self.device, dtype=self.dtype)
+        return latents
+    
+
+# create the shared resources and start the video processing thread
 shared_resources = SharedResources()
 video_thread = VideoProcessingThread(shared_resources, device_path=Config.VIDEO_PATH)
 video_thread.start()
@@ -357,7 +417,7 @@ def refresh_latents():
         if signal != "refresh":
             return jsonify({"error": "Invalid signal"}), 400
         
-        # Refresh the latents
+        # refresh the latents
         with shared_resources.lock:
             shared_resources.image_transformer.refresh_latents()
         
@@ -405,15 +465,16 @@ def stream():
 #             emit('frame', {'data': encoded_img})  # Send frame to connected clients
 #         time.sleep(0.1)  # Control frame rate
 
-# Cleanup function for releasing resources
+
 def cleanup():
+    "Cleanup resources at the end."
     shared_resources.stop_event.set() 
     video_thread.join() 
     del shared_resources
     gc.collect()  
     torch.cuda.empty_cache()  
 
-# Register cleanup 
+# leave it better than we found it
 atexit.register(cleanup)
 
 if __name__ == "__main__":
