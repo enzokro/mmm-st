@@ -21,6 +21,22 @@
         <img id="liveImage" src="" alt="Live Image Stream" style="max-width: 100%; max-height: 100%; object-fit: contain;" />
     </div>
 
+    <!-- <script>
+        // Get the WebSocket URL based on the current window's location
+        const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';  // Use 'wss' for secure connections
+        const host = window.location.host;  // This gives 'localhost:8989', or the actual host in production
+        const socketUrl = `${protocol}://${host}`;  // Construct the WebSocket URL
+        
+        // Connect to the WebSocket endpoint
+        const socket = io.connect(socketUrl);  // Adjust as needed
+
+        // Update the image when receiving data
+        socket.on('frame', (data) => {
+            const liveImage = document.getElementById('liveImage');
+            liveImage.src = 'data:image/jpeg;base64,' + data.data;  // Update the image
+        });
+    </script> -->
+
     <script src="{{ url_for('static', filename='app.js') }}"></script>
 </body>
 </html>

@@ -2,6 +2,9 @@ var eventSource = new EventSource("/stream");
 eventSource.onmessage = function(event) {
     document.getElementById('liveImage').src = 'data:image/jpeg;base64,' + event.data;
 };
+eventSource.onerror = function() {
+    console.error("Error receiving stream");  // Handle errors
+};
 
 document.getElementById('promptForm').addEventListener('submit', function(e) {
     e.preventDefault();

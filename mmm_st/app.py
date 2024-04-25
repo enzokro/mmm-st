@@ -6,6 +6,7 @@ import atexit
 import logging
 import threading
 from io import BytesIO
+from queue import Queue
 import numpy as np
 import torch
 import cv2
@@ -23,6 +24,7 @@ from diffusers.utils.torch_utils import randn_tensor
 from transformers import DPTImageProcessor, DPTForDepthEstimation
 from huggingface_hub import hf_hub_download
 from flask import Flask, jsonify, request, Response, render_template, stream_with_context
+# from flask_socketio import SocketIO, emit
 from mmm_st.config import Config as BaseConfig
 from mmm_st.diffuse import BaseTransformer
 from mmm_st.video import convert_to_pil_image
@@ -30,6 +32,7 @@ from mmm_st.video import convert_to_pil_image
 
 # Create Flask app
 app = Flask(__name__)
+# socketio = SocketIO(app, async_mode="eventlet", cors_allowed_origins="*")
 
 # Basic logging configuration
 logging.basicConfig(level=logging.INFO)
@@ -78,14 +81,15 @@ class SharedResources:
         self.current_prompt = None
         self.lock = threading.Lock()  # Ensure thread-safe access
         self.stop_event = threading.Event()  # Signal to stop thread
+        self.frame_queue = Queue()  # Queue for frame streaming
 
     def update_frame(self, frame):
         with self.lock:
             self.current_frame = frame
+            self.frame_queue.put(frame)  # Add frame to queue
 
     def get_frame(self):
-        with self.lock:
-            return self.current_frame
+        return self.frame_queue.get()  # Get the latest frame from queue
 
     def update_prompt(self, prompt):
         with self.lock:
@@ -356,10 +360,28 @@ def stream():
                 img_byte_arr.seek(0)
                 encoded_img = base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
                 yield f"data: {encoded_img}\n\n"
-                # time.sleep(1 / 30)  # Frame rate control
+                time.sleep(1 / 30)  # Frame rate control
 
     return Response(stream_with_context(generate()), mimetype='text/event-stream')
 
+
+# # WebSocket events for connection and streaming
+# @socketio.on('connect')
+# def handle_connect():
+#     print('Client connected')
+#     emit('connected', {'message': 'Connection established'})
+
+# @socketio.on('stream')
+# def stream():
+#     while not shared_resources.stop_event.is_set():
+#         frame = shared_resources.get_frame()
+#         if frame:
+#             img_byte_arr = BytesIO()
+#             frame.save(img_byte_arr, format='JPEG')
+#             img_byte_arr.seek(0)
+#             encoded_img = base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
+#             emit('frame', {'data': encoded_img})  # Send frame to connected clients
+#         time.sleep(0.1)  # Control frame rate
 
 # Cleanup function for releasing resources
 def cleanup():
