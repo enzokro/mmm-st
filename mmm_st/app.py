@@ -300,6 +300,7 @@ class SDXL(BaseTransformer):
             vae=vae,
             # NOTE: try using the same contorlnet twice, with different strengths and images
             controlnet=[controlnet_depth, controlnet_pose],
+            # controlnet=controlnet_depth,
         )
 
         # sampler with trailing timesteps per the docs
@@ -350,6 +351,7 @@ class SDXL(BaseTransformer):
         results = self.pipe(
             prompt=prompt,
             image=[depth_image, pose_image],
+            # image=depth_image,
             negative_prompt=self.negative_prompt,
             controlnet_conditioning_scale=self.controlnet_scale,
             num_inference_steps=steps,
