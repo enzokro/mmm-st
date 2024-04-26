@@ -10,6 +10,7 @@ from queue import Queue
 from PIL import Image
 import numpy as np
 import torch
+import torch._dynamo as dynamo
 import cv2
 from fastcore.basics import store_attr
 from safetensors.torch import load_file
@@ -26,21 +27,34 @@ from transformers import DPTImageProcessor, DPTForDepthEstimation
 from controlnet_aux import OpenposeDetector
 from huggingface_hub import hf_hub_download
 from flask import Flask, jsonify, request, Response, render_template, stream_with_context
-# from flask_socketio import SocketIO, emit
+from flask_socketio import SocketIO, emit
 from mmm_st.config import Config as BaseConfig
 from mmm_st.diffuse import BaseTransformer
 from mmm_st.video import convert_to_pil_image
 
 
+
 # Create Flask app
 app = Flask(__name__)
-
-# TODO: switch stream to web socket
-# socketio = SocketIO(app, async_mode="eventlet", cors_allowed_origins="*")
+socketio = SocketIO(app, async_mode="eventlet", cors_allowed_origins="*")
 
 # setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+# set the proper device
+if torch.cuda.is_available():
+    device = "cuda" #torch.device("cuda")
+    # test optimizations
+    torch._dynamo.config.verbose = True
+    torch._dynamo.config.suppress_errors = True
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+elif torch.backends.mps.is_available():
+    device = "mps" # torch.device("mps")
+else:
+    device = "cpu" #torch.device("cpu")
 
 
 # parameters for the run
@@ -76,7 +90,7 @@ class Config:
     CONTROLNET_POSE = "thibaud/controlnet-openpose-sdxl-1.0"
     
     # scheduler type
-    SCHEDULER = 'ddpm2'
+    SCHEDULER = 'ddim'
 
 
 # fix the seed for reproducibility
@@ -188,10 +202,13 @@ class VideoProcessingThread(threading.Thread):
             current_prompt = self.shared_resources.get_prompt()
 
             # transform the current frame
-            transformed_frame = self.shared_resources.image_transformer.transform(
-                current_frame,
-                current_prompt,
-            )
+            if current_prompt not in (None, ""):
+                transformed_frame = self.shared_resources.image_transformer.transform(
+                    current_frame,
+                    current_prompt,
+                )
+            else:
+                transformed_frame = current_frame
 
             # interpolate it with the previous frame 
             if self.previous_frame is not None:
@@ -231,12 +248,12 @@ class SDXL(BaseTransformer):
             height=Config.HEIGHT,
             dtype=Config.DTYPE,
             scheduler=Config.SCHEDULER,
+            device=device,
             **kwargs,
         ):
         store_attr()
         self.generator = torch.Generator(device="cpu").manual_seed(Config.SEED)
-        self.device = torch.device(self.device)
-        super().__init__(**kwargs)
+        super().__init__(device=device, **kwargs)
 
     def _initialize_pipeline(self):
         "Sets up the pipeline."
@@ -252,8 +269,8 @@ class SDXL(BaseTransformer):
         controlnet_pose = ControlNetModel.from_pretrained(
             Config.CONTROLNET_POSE,
             torch_dtype=self.dtype,
-            use_safetensors=True,
-        ).to(self.device)   
+            # use_safetensors=True,
+        ).to(self.device) 
 
         # model for depth estimation
         self.depth_estimator = DPTForDepthEstimation.from_pretrained("Intel/dpt-hybrid-midas").to(self.device)
@@ -295,8 +312,15 @@ class SDXL(BaseTransformer):
         # final pipeline setup
         self.pipe.set_progress_bar_config(disable=True)
         self.pipe.to(device=self.device, dtype=self.dtype).to(self.device)
-        if self.device not in ("mps", torch.device("mps")):
+        # optimizations assuming we're on a ~new GPU
+        if self.device != torch.device("mps"):
+            print("Set UNet to channels_last")
             self.pipe.unet.to(memory_format=torch.channels_last)
+            self.pipe.controlnet.to(memory_format=torch.channels_last)
+        # print("Compiling the UNets...")
+        # self.pipe.unet = torch.compile(self.pipe.unet, mode="reduce-overhead", fullgraph=True)
+        # self.pipe.controlnet = torch.compile(self.pipe.controlnet, mode="reduce-overhead", fullgraph=True)
+        # print("UNet compiled.")
 
         # start with a fixed set of latents
         batch_size, num_images_per_prompt = 1, 1
@@ -325,9 +349,9 @@ class SDXL(BaseTransformer):
         # generate and return the image
         results = self.pipe(
             prompt=prompt,
-            negative_prompt=self.negative_prompt,
             image=[depth_image, pose_image],
-            controlnet_conditioning_scale=[self.controlnet_scale, self.controlnet_scale],
+            negative_prompt=self.negative_prompt,
+            controlnet_conditioning_scale=self.controlnet_scale,
             num_inference_steps=steps,
             guidance_scale=self.cfg,
             strength=self.strength,
@@ -366,8 +390,8 @@ class SDXL(BaseTransformer):
     
     def get_pose_map(self, image):
         "Builds the controlnet pose map."
-        with torch.no_grad(), torch.autocast(self.device):
-            pose_image = self.openpose(image)
+        # with torch.no_grad(), torch.autocast(self.device):
+        pose_image = self.openpose(image)
         pose_image = pose_image.resize((self.width, self.height))
         return pose_image
     
@@ -377,7 +401,7 @@ class SDXL(BaseTransformer):
 
     def refresh_latents(self):
         "Creates a fixed set of latents for ~reproducible images."
-        latents = randn_tensor(self.latents_shape, generator=self.generator, device=self.device, dtype=self.dtype)
+        latents = randn_tensor(self.latents_shape, generator=self.generator, device=torch.device(self.device), dtype=self.dtype)
         return latents
     
 
@@ -421,50 +445,52 @@ def refresh_latents():
         return jsonify({"error": "Could not refresh latents"}), 500
 
 
-# Flask endpoint to stream the latest frame
-@app.route('/stream')
-def stream():
-    def generate():
-        while not shared_resources.stop_event.is_set():
-            frame = shared_resources.get_frame()
-            if frame is not None:
-                # rescale to better fit the image
-                frame = convert_to_pil_image(frame)
-                frame = frame.resize((Config.DISPLAY_WIDTH, Config.DISPLAY_HEIGHT))
-                img_byte_arr = BytesIO()
-                frame.save(img_byte_arr, format='JPEG')
-                img_byte_arr.seek(0)
-                encoded_img = base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
-                yield f"data: {encoded_img}\n\n"
-                time.sleep(1 / 30)  # Frame rate control
-
-    return Response(stream_with_context(generate()), mimetype='text/event-stream')
-
-
-# # WebSocket events for connection and streaming
-# @socketio.on('connect')
-# def handle_connect():
-#     print('Client connected')
-#     emit('connected', {'message': 'Connection established'})
-
-# @socketio.on('stream')
+# # Flask endpoint to stream the latest frame
+# @app.route('/stream')
 # def stream():
-#     while not shared_resources.stop_event.is_set():
-#         frame = shared_resources.get_frame()
-#         if frame:
-#             img_byte_arr = BytesIO()
-#             frame.save(img_byte_arr, format='JPEG')
-#             img_byte_arr.seek(0)
-#             encoded_img = base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
-#             emit('frame', {'data': encoded_img})  # Send frame to connected clients
-#         time.sleep(0.1)  # Control frame rate
+#     def generate():
+#         while not shared_resources.stop_event.is_set():
+#             frame = shared_resources.get_frame()
+#             if frame is not None:
+#                 # rescale to better fit the image
+#                 frame = convert_to_pil_image(frame)
+#                 frame = frame.resize((Config.DISPLAY_WIDTH, Config.DISPLAY_HEIGHT))
+#                 img_byte_arr = BytesIO()
+#                 frame.save(img_byte_arr, format='JPEG')
+#                 img_byte_arr.seek(0)
+#                 encoded_img = base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
+#                 yield f"data: {encoded_img}\n\n"
+#                 time.sleep(1 / 30)  # Frame rate control
+
+#     return Response(stream_with_context(generate()), mimetype='text/event-stream')
+
+
+# WebSocket events for connection and streaming
+@socketio.on('connect')
+def handle_connect():
+    print('Client connected')
+    emit('connected', {'message': 'Connection established'})
+
+@socketio.on('stream')
+def stream():
+    while not shared_resources.stop_event.is_set():
+        frame = shared_resources.get_frame()
+        if frame:
+            img_byte_arr = BytesIO()
+            # rescale to better display the image
+            frame = convert_to_pil_image(frame)
+            frame = frame.resize((Config.DISPLAY_WIDTH, Config.DISPLAY_HEIGHT))
+            frame.save(img_byte_arr, format='JPEG')
+            img_byte_arr.seek(0)
+            encoded_img = base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
+            emit('frame', {'data': encoded_img})  # Send frame to connected clients
+        time.sleep(0.1)  # Control frame rate
 
 
 def cleanup():
     "Cleanup resources at the end."
     shared_resources.stop_event.set() 
     video_thread.join() 
-    del shared_resources
     gc.collect()  
     torch.cuda.empty_cache()  
 
