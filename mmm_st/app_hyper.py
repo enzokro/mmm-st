@@ -35,6 +35,14 @@ class Config:
     NEGATIVE_PROMPT = "low quality, blurry, distorted"
     MODEL_NAME = "stabilityai/stable-diffusion-xl-base-1.0"
 
+    # model params
+    CFG = 1.0
+    STRENGTH = 0.75
+    CONTROLNET_SCALE = 0.5
+    CONTROLNET_START = 0.0
+    CONTROLNET_END = 1.0
+    ETA = 1.0
+    
 torch.manual_seed(Config.SEED)
 
 depth_estimator = DPTForDepthEstimation.from_pretrained("Intel/dpt-hybrid-midas").to(Config.DEVICE)
@@ -64,11 +72,11 @@ def get_depth_map(image):
 class SDXL_Turbo(BaseTransformer):
     def __init__(
             self,
-            cfg=1.0,
-            strength=0.75,
-            controlnet_scale=0.5,
-            controlnet_start=0.0,
-            controlnet_end=1.0,
+            cfg=Config.CFG,
+            strength=Config.STRENGTH,
+            controlnet_scale=Config.CONTROLNET_SCALE,
+            controlnet_start=Config.CONTROLNET_START,
+            controlnet_end=Config.CONTROLNET_END,
             width=Config.WIDTH,
             height=Config.HEIGHT,
             **kwargs,
@@ -122,7 +130,7 @@ class SDXL_Turbo(BaseTransformer):
         control_image = get_depth_map(image)
 
         # Lower eta for more detail in multi-step inference
-        eta = 1.0
+        eta = Config.ETA
 
         results = self.pipe(
             prompt=prompt,
