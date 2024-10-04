@@ -1,0 +1,18 @@
+[project]
+name = "mmm-st"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "transformers",
+    "diffusers",
+    "accelerate",
+    "torch",
+    "torchvision",
+    "torchaudio",
+    "fastcore",
+    "controlnet-aux",
+    "opencv-python",
+    "Flask",
+]
