@@ -8,6 +8,7 @@ dependencies = [
     "transformers",
     "diffusers",
     "accelerate",
+    "peft",
     "torch",
     "torchvision",
     "torchaudio",
@@ -15,4 +16,6 @@ dependencies = [
     "controlnet-aux",
     "opencv-python",
     "Flask",
+    "flask-socketio",
+    "python-fasthtml",
 ]

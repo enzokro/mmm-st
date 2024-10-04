@@ -1,90 +1,42 @@
 import gc
-import atexit
-import math
-from io import BytesIO
-import base64
 import time
+import math
+import atexit
+import base64
 import logging
-from flask import Flask, jsonify, request, Response, render_template, send_file, stream_with_context
+from io import BytesIO
 from PIL import Image
+from flask import Flask, jsonify, request, Response, render_template, send_file, stream_with_context
+import cv2
 import torch
 import numpy as np
-import cv2  # Using OpenCV for video capture
 from transformers import DPTImageProcessor, DPTForDepthEstimation
-from mmm_st.config import Config
-from mmm_st.diffuse import BaseTransformer
-from mmm_st.video import convert_to_pil_image
+from diffusers import ControlNetModel, StableDiffusionXLControlNetImg2ImgPipeline, AutoencoderKL, TCDScheduler
+from huggingface_hub import hf_hub_download
 from fastcore.basics import store_attr
 
-### Tests with SDXL turbo
-from diffusers import (
-    StableDiffusionXLControlNetImg2ImgPipeline,
-    ControlNetModel,
-    AutoencoderKL,
-)
+# our imports
+from config import Config
+from utils import BaseTransformer, get_depth_map, VideoStreamer, interpolate_images, convert_to_pil_image
 
+# create the flask app
 app = Flask(__name__)
-
-SEED = Config.SEED
-torch.manual_seed(Config.SEED)
-
-# Import and use configurations from an external module if necessary
-class Config:
-    HOST = '0.0.0.0'
-    PORT = 8989
-    CAP_PROPS = {'CAP_PROP_FPS': 30}
-    TRANSFORM_TYPE = "kandinsky"
-    NUM_STEPS = 4
-    HEIGHT = 1024
-    WIDTH = 1024
-
 
 # Setup basic logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# set seed
+torch.manual_seed(Config.SEED)
 
-# controlnet_model = "diffusers/controlnet-canny-sdxl-1.0"
-controlnet_model = "diffusers/controlnet-depth-sdxl-1.0"
-model_id = "stabilityai/sdxl-turbo"
-taesd_model = "madebyollin/taesdxl"
-
-torch_dtype = torch.float16
-
-depth_estimator = DPTForDepthEstimation.from_pretrained("Intel/dpt-hybrid-midas").to("cuda")
-feature_extractor = DPTImageProcessor.from_pretrained("Intel/dpt-hybrid-midas")
-
-
-def get_depth_map(image):
-    image = feature_extractor(images=image, return_tensors="pt").pixel_values.to("cuda")
-    with torch.no_grad(), torch.autocast("cuda"):
-        depth_map = depth_estimator(image).predicted_depth
-
-    depth_map = torch.nn.functional.interpolate(
-        depth_map.unsqueeze(1),
-        size=(Config.HEIGHT, Config.WIDTH),
-        mode="bicubic",
-        align_corners=False,
-    )
-    depth_min = torch.amin(depth_map, dim=[1, 2, 3], keepdim=True)
-    depth_max = torch.amax(depth_map, dim=[1, 2, 3], keepdim=True)
-    depth_map = (depth_map - depth_min) / (depth_max - depth_min)
-    image = torch.cat([depth_map] * 3, dim=1)
-
-    image = image.permute(0, 2, 3, 1).cpu().numpy()[0]
-    image = Image.fromarray((image * 255.0).clip(0, 255).astype(np.uint8))
-    return image
-
-class SDXL_Turbo(BaseTransformer):
+class SDXL_Hyper(BaseTransformer):
     def __init__(
             self,
-            cfg=1.0,
-            strength=1.0,
-            canny_low_threshold=100,
-            canny_high_threshold=200,
-            controlnet_scale=0.8,
-            controlnet_start=0.0,
-            controlnet_end=1.0,
+            cfg=Config.CFG,
+            strength=Config.STRENGTH,
+            controlnet_scale=Config.CONTROLNET_SCALE,
+            controlnet_start=Config.CONTROLNET_START,
+            controlnet_end=Config.CONTROLNET_END,
             width=Config.WIDTH,
             height=Config.HEIGHT,
             **kwargs,
@@ -92,30 +44,47 @@ class SDXL_Turbo(BaseTransformer):
         super().__init__(**kwargs)
         store_attr()
 
-        self.generator = torch.Generator(device="cpu").manual_seed(SEED)
-        controlnet_canny = ControlNetModel.from_pretrained(
-            controlnet_model,
-            torch_dtype=torch_dtype,
-            use_safetensors=True,
+        self.generator = torch.Generator(device="cpu").manual_seed(Config.SEED)
+        self._initialize_pipeline()
+
+    def _initialize_pipeline(self):
+        base_model_id = "stabilityai/stable-diffusion-xl-base-1.0"
+        repo_name = "ByteDance/Hyper-SD"
+        ckpt_name = "Hyper-SDXL-1step-lora.safetensors"
+
+        controlnet = ControlNetModel.from_pretrained(
+            "diffusers/controlnet-depth-sdxl-1.0",
+            torch_dtype=torch.float16
         ).to(self.device)
+
         vae = AutoencoderKL.from_pretrained(
-            "madebyollin/sdxl-vae-fp16-fix", torch_dtype=torch_dtype
+            "madebyollin/sdxl-vae-fp16-fix", 
+            torch_dtype=torch.float16
         )
 
         self.pipe = StableDiffusionXLControlNetImg2ImgPipeline.from_pretrained(
-            model_id,
-            use_safetensors=True,
-            controlnet=controlnet_canny,
+            base_model_id,
+            controlnet=controlnet,
             vae=vae,
-        )
+            torch_dtype=torch.float16,
+            variant="fp16"
+        ).to(self.device)
 
-        self.pipe.set_progress_bar_config(disable=True)
-        self.pipe.to(device=self.device, dtype=torch_dtype).to(self.device)
+        self.pipe.load_lora_weights(hf_hub_download(repo_name, ckpt_name))
+        self.pipe.fuse_lora()
+
+        # Use TCD scheduler for better image quality
+        self.pipe.scheduler = TCDScheduler.from_config(self.pipe.scheduler.config)
+
         if self.device != "mps":
             self.pipe.unet.to(memory_format=torch.channels_last)
+            self.pipe.controlnet.to(memory_format=torch.channels_last)
 
-    def _initialize_pipeline(self):
-        pass
+        # Initialize latents
+        batch_size = 1
+        num_channels_latents = self.pipe.unet.config.in_channels
+        self.latents_shape = (batch_size, num_channels_latents, self.height // self.pipe.vae_scale_factor, self.width // self.pipe.vae_scale_factor)
+        self.latents = self.refresh_latents()
 
     def transform(self, image, prompt) -> Image.Image:
         image = self.input_image or image
@@ -126,116 +95,73 @@ class SDXL_Turbo(BaseTransformer):
         negative_pooled_prompt_embeds = None
 
         control_image = get_depth_map(image)
-        steps = self.num_steps
-        if int(steps * self.strength) < 1:
-            steps = math.ceil(1 / max(0.10, self.strength))
+
+        # Lower eta for more detail in multi-step inference
+        eta = Config.ETA
 
         results = self.pipe(
+            prompt=prompt,
             image=image,
             control_image=control_image,
-            prompt=prompt,
             negative_prompt=negative_prompt,
             prompt_embeds=prompt_embeds,
             pooled_prompt_embeds=pooled_prompt_embeds,
             negative_prompt_embeds=negative_prompt_embeds,
             negative_pooled_prompt_embeds=negative_pooled_prompt_embeds,
             generator=self.generator,
-            strength=self.strength,
-            num_inference_steps=steps,
+            num_inference_steps=self.num_steps,
             guidance_scale=self.cfg,
-            width=self.width,
-            height=self.height,
-            output_type="pil",
+            strength=self.strength,
             controlnet_conditioning_scale=self.controlnet_scale,
             control_guidance_start=self.controlnet_start,
             control_guidance_end=self.controlnet_end,
+            width=self.width,
+            height=self.height,
+            latents=self.get_latents(),
+            output_type="pil",
+            eta=eta,
         )
 
         result_image = results.images[0]
         return result_image
 
+    def get_latents(self):
+        return self.latents.clone()
 
-class VideoStreamer:
-    """ Continuously reads frames from a video capture source. """
-    def __init__(self, device_path='/dev/video0'):
-        self.cap = cv2.VideoCapture(device_path)
-        if not self.cap.isOpened():
-            logger.error("Failed to open video source")
-            raise ValueError("Video source cannot be opened")
-        for prop, value in Config.CAP_PROPS.items():
-            self.cap.set(getattr(cv2, prop), value)
+    def refresh_latents(self):
+        self.latents = torch.randn(self.latents_shape, generator=self.generator, device=self.device, dtype=Config.DTYPE)
+        return self.latents
 
-    def get_current_frame(self):
-        ret, frame = self.cap.read()
-        if not ret:
-            return None
-        return Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
 
-    def release(self):
-        self.cap.release()
 
 # Shared global variables
 current_prompt = None
 previous_frame = None
-path = '/dev/video0'
-video_streamer = VideoStreamer('/dev/video0') 
-image_transformer = SDXL_Turbo(
+video_streamer = VideoStreamer(Config.VIDEO_PATH) 
+image_transformer = SDXL_Hyper(
     num_steps=Config.NUM_STEPS,
-    img_size = (Config.WIDTH, Config.HEIGHT)
+    img_size=(Config.WIDTH, Config.HEIGHT)
 )
 
-
 def transform_frame(previous_frame, prompt=None):
-    """
-    Fetches a frame from the video streamer, applies a transformation based on the provided prompt,
-    and interpolates it with the previous frame.
-    
-    Args:
-        video_streamer (VideoStreamer): The video streamer object.
-        image_transformer (Callable): Function to transform the frame based on the prompt.
-        previous_frame (Image.Image): The previous frame to interpolate with.
-        prompt (str, optional): The prompt based on which the transformation is applied.
-
-    Returns:
-        Image.Image: The updated frame after transformation and interpolation.
-    """
     global video_streamer
     global image_transformer
     current_frame = video_streamer.get_current_frame()
     if current_frame is None:
-        return previous_frame  # Return the previous frame if no new frame is captured
-
-    # if previous_frame is not None:
-    #     current_frame = interpolate_images(current_frame, previous_frame, 0.25)
+        return previous_frame
 
     if prompt:
-        # Transform the current frame based on the prompt
         transformed_image = image_transformer(current_frame, prompt)
     else:
         transformed_image = current_frame
 
-    # # Interpolate between the previous frame and the transformed image
-    # if previous_frame is not None:
-    #     output_frame = interpolate_images(previous_frame, transformed_image, alpha=0.5)
-    # else:
-    #     output_frame = transformed_image
-
-    output_frame = transformed_image
-
-    return output_frame
-
-
-def interpolate_images(image1, image2, alpha=0.5):
-    """ Interpolates two images with a given alpha blending factor. """
-    if image1.size != image2.size:
-        image2 = image2.resize(image1.size)
-    return Image.blend(image1, image2, alpha)
+    return transformed_image
 
 
 @app.route('/')
 def index():
     return render_template('index.html')
-
+    
 
 @app.route('/set_prompt', methods=['POST'])
 def set_prompt():
@@ -245,7 +171,6 @@ def set_prompt():
         return jsonify({"error": "Prompt is required"}), 400
     current_prompt = prompt
     return jsonify({"message": "Prompt set successfully"})
-
 
 @app.route('/stream')
 def stream():
@@ -263,22 +188,20 @@ def stream():
                     prompt=current_prompt)
                 previous_frame = output_frame
 
-                cnt += 1
-
                 # # set the new image as the previous, to condition on
                 # image_transformer.set_image(previous_frame)
+
+                cnt += 1
 
                 if cnt == decim:
                     img_byte_arr = BytesIO()
                     pil_image = convert_to_pil_image(output_frame)
-                    # rescale to better fit the image
-                    pil_image = pil_image.resize((1920, 1080))
+                    pil_image = output_frame.resize((Config.OUTPUT_WIDTH, Config.OUTPUT_HEIGHT))
                     pil_image.save(img_byte_arr, format='JPEG')
                     img_byte_arr.seek(0)
                     encoded_img = base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
                     yield f"data: {encoded_img}\n\n"
                     cnt = 0
-                # time.sleep(1 / 15)  # Control frame rate
         finally:
             video_streamer.release()
 
@@ -288,7 +211,6 @@ def cleanup():
     print("Application is shutting down. Cleaning up resources.")
     global video_streamer
     global image_transformer
-    # del image_transformer
     video_streamer.release()
     gc.collect()
     torch.cuda.empty_cache()

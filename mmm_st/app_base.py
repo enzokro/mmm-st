@@ -11,51 +11,49 @@ import torch
 import numpy as np
 import cv2  # Using OpenCV for video capture
 from transformers import DPTImageProcessor, DPTForDepthEstimation
-from mmm_st.config import Config as BaseConfig
+from mmm_st.config import Config
 from mmm_st.diffuse import BaseTransformer
 from mmm_st.video import convert_to_pil_image
 from fastcore.basics import store_attr
 
-# Tests with SDXL turbo
+### Tests with SDXL turbo
 from diffusers import (
-    StableDiffusionXLControlNetPipeline,
+    StableDiffusionXLControlNetImg2ImgPipeline,
     ControlNetModel,
     AutoencoderKL,
 )
-from diffusers.utils.torch_utils import randn_tensor
 
 app = Flask(__name__)
+
+SEED = Config.SEED
+torch.manual_seed(Config.SEED)
 
 # Import and use configurations from an external module if necessary
 class Config:
     HOST = '0.0.0.0'
     PORT = 8989
     CAP_PROPS = {'CAP_PROP_FPS': 30}
+    TRANSFORM_TYPE = "kandinsky"
     NUM_STEPS = 4
     HEIGHT = 1024
     WIDTH = 1024
-    SEED = BaseConfig.SEED
 
 
 # Setup basic logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Set the seed and data type for torch
-SEED = Config.SEED
-torch.manual_seed(Config.SEED)
-torch_dtype = torch.float16
 
-# Models for image and controlnet
 # controlnet_model = "diffusers/controlnet-canny-sdxl-1.0"
 controlnet_model = "diffusers/controlnet-depth-sdxl-1.0"
 model_id = "stabilityai/sdxl-turbo"
 taesd_model = "madebyollin/taesdxl"
 
+torch_dtype = torch.float16
 
-# for depth estimation
 depth_estimator = DPTForDepthEstimation.from_pretrained("Intel/dpt-hybrid-midas").to("cuda")
 feature_extractor = DPTImageProcessor.from_pretrained("Intel/dpt-hybrid-midas")
+
 
 def get_depth_map(image):
     image = feature_extractor(images=image, return_tensors="pt").pixel_values.to("cuda")
@@ -81,10 +79,10 @@ class SDXL_Turbo(BaseTransformer):
     def __init__(
             self,
             cfg=1.0,
-            strength=0.75,
+            strength=1.0,
             canny_low_threshold=100,
             canny_high_threshold=200,
-            controlnet_scale=0.5,
+            controlnet_scale=0.8,
             controlnet_start=0.0,
             controlnet_end=1.0,
             width=Config.WIDTH,
@@ -93,10 +91,9 @@ class SDXL_Turbo(BaseTransformer):
         ):
         super().__init__(**kwargs)
         store_attr()
-        self.generator = torch.Generator(device="cpu").manual_seed(SEED)
-        self.device = torch.device(self.device)
 
-        controlnet = ControlNetModel.from_pretrained(
+        self.generator = torch.Generator(device="cpu").manual_seed(SEED)
+        controlnet_canny = ControlNetModel.from_pretrained(
             controlnet_model,
             torch_dtype=torch_dtype,
             use_safetensors=True,
@@ -105,10 +102,10 @@ class SDXL_Turbo(BaseTransformer):
             "madebyollin/sdxl-vae-fp16-fix", torch_dtype=torch_dtype
         )
 
-        self.pipe = StableDiffusionXLControlNetPipeline.from_pretrained(
+        self.pipe = StableDiffusionXLControlNetImg2ImgPipeline.from_pretrained(
             model_id,
             use_safetensors=True,
-            controlnet=controlnet,
+            controlnet=controlnet_canny,
             vae=vae,
         )
 
@@ -116,18 +113,6 @@ class SDXL_Turbo(BaseTransformer):
         self.pipe.to(device=self.device, dtype=torch_dtype).to(self.device)
         if self.device != "mps":
             self.pipe.unet.to(memory_format=torch.channels_last)
-
-        # create uniform, shared latents
-        batch_size, num_images_per_prompt = 1, 1
-        batch_size *= num_images_per_prompt
-        num_channels_latents = self.pipe.unet.config.in_channels
-        shape = (batch_size, num_channels_latents, height // self.pipe.vae_scale_factor, width // self.pipe.vae_scale_factor)
-        latents = randn_tensor(shape, generator=self.generator, device=self.device, dtype=torch_dtype)
-        # print('local latents:', latents.shape, latents.dtype, latents.device, latents.max().item(), latents.min().item(), latents.mean().item())
-        self.latents = latents
-
-    def get_latents(self):
-        return self.latents.clone()
 
     def _initialize_pipeline(self):
         pass
@@ -164,7 +149,6 @@ class SDXL_Turbo(BaseTransformer):
             controlnet_conditioning_scale=self.controlnet_scale,
             control_guidance_start=self.controlnet_start,
             control_guidance_end=self.controlnet_end,
-            latents=self.get_latents(),
         )
 
         result_image = results.images[0]
@@ -193,8 +177,8 @@ class VideoStreamer:
 # Shared global variables
 current_prompt = None
 previous_frame = None
-path = '/dev/video0'
-video_streamer = VideoStreamer('/dev/video0') 
+cam_path = '/dev/video0'
+video_streamer = VideoStreamer(cam_path) 
 image_transformer = SDXL_Turbo(
     num_steps=Config.NUM_STEPS,
     img_size = (Config.WIDTH, Config.HEIGHT)
