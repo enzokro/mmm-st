@@ -1,509 +1,445 @@
+#!/usr/bin/env python3
+"""
+Real-time video transformation using SD 3.5 with multiple transformer options.
+
+This implementation uses FastHTML with MonsterUI for a modern, responsive UI.
+Key features:
+- Multiple transformer models (SD3.5 Turbo, ControlNets for depth/canny/blur)
+- WebSockets for real-time video streaming
+- Component-based architecture with clear separation of concerns
+"""
+
+import os
 import gc
-import math
 import time
-import base64
 import atexit
+import base64
 import logging
+import asyncio
 import threading
 from io import BytesIO
-from queue import Queue
-from PIL import Image
-import numpy as np
-import torch
-import torch._dynamo as dynamo
-import cv2
-from fastcore.basics import store_attr
-from safetensors.torch import load_file
-from huggingface_hub import hf_hub_download
-from diffusers import (
-    StableDiffusionXLControlNetPipeline,
-    ControlNetModel,
-    AutoencoderKL,
-    UNet2DConditionModel,
-)
-from diffusers import EulerDiscreteScheduler, DDIMScheduler, DDPMScheduler, KDPM2DiscreteScheduler
-from diffusers.utils.torch_utils import randn_tensor
-from transformers import DPTImageProcessor, DPTForDepthEstimation
-from controlnet_aux import OpenposeDetector
-from huggingface_hub import hf_hub_download
-from flask import Flask, jsonify, request, Response, render_template, stream_with_context
-from flask_socketio import SocketIO, emit
-from mmm_st.config import Config as BaseConfig
-from mmm_st.diffuse import BaseTransformer
-from mmm_st.video import convert_to_pil_image
 
+# Import FastHTML and MonsterUI components
+from fasthtml.common import *
+from monsterui.all import *
 
+# Import transformer models
+from tfm import TransformerManager, SD35Transformer
 
-# Create Flask app
-app = Flask(__name__)
-socketio = SocketIO(app, async_mode="eventlet", cors_allowed_origins="*")
+# Import utilities and config
+from utils import SharedResources, VideoProcessingThread, convert_to_pil_image
+from config import Config
 
-# setup logging
+# Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Create FastHTML app with MonsterUI theme
+app, rt = fast_app(
+    hdrs=Theme.blue.headers(),
+    title="SD 3.5 Video Transformer",
+    static_path="static",  # Directory for static files
+)
 
-# set the proper device
-if torch.cuda.is_available():
-    device = "cuda" #torch.device("cuda")
-    # test optimizations
-    torch._dynamo.config.verbose = True
-    torch._dynamo.config.suppress_errors = True
-    torch.backends.cudnn.benchmark = True
-    torch.backends.cuda.matmul.allow_tf32 = True
-elif torch.backends.mps.is_available():
-    device = "mps" # torch.device("mps")
-else:
-    device = "cpu" #torch.device("cpu")
-
-
-# parameters for the run
-class Config:
-
-    # basic app params
-    HOST = '0.0.0.0'
-    PORT = 8989
-    SEED  = BaseConfig.SEED
-    VIDEO_PATH = '/dev/video0'
-    CAP_PROPS = {}
-
-    # for the denoised image
-    NUM_STEPS = 4
-    HEIGHT = 1024
-    WIDTH = 1024
-
-    # size of the final image sent over
-    DISPLAY_WIDTH = 1920
-    DISPLAY_HEIGHT = 1080
-
-    # alpha blending factor for frame interpolation
-    FRAME_BLEND = 0.75
-
-    # default data type for torch
-    DTYPE = torch.float16
-
-    # models for denoising, and controlnet
-    MODEL_ID = "stabilityai/stable-diffusion-xl-base-1.0"
-    UNET_ID = "ByteDance/SDXL-Lightning"
-    UNET_CKPT = "sdxl_lightning_4step_unet.safetensors"
-    CONTROLNET_DEPTH = "diffusers/controlnet-depth-sdxl-1.0"
-    CONTROLNET_POSE = "thibaud/controlnet-openpose-sdxl-1.0"
-    
-    # scheduler type
-    SCHEDULER = 'ddim'
-
-
-# fix the seed for reproducibility
-torch.manual_seed(Config.SEED)
-
-# map from name to scheduler 
-name2sched = {
-    'ddpm':  DDPMScheduler,
-    'ddim':  DDIMScheduler,
-    'euler': EulerDiscreteScheduler,
-    'ddpm2': KDPM2DiscreteScheduler,
-}
-
-
-class SharedResources:
-    """Manages shared resources.
-    
-    Creates the following:
-        - Stable Diffusion pipeline
-        - Current input prompt
-        - Current generated frame
-
-    Uses locks, events, and queues for concurrency.
-    """
-    def __init__(self):
-        self.image_transformer = SDXL(
-            num_steps=Config.NUM_STEPS,
-            height=Config.HEIGHT,
-            width=Config.WIDTH,
-        )
-        self.current_frame = None
-        self.current_prompt = None
-        self.lock = threading.Lock() 
-        self.stop_event = threading.Event() 
-        self.frame_queue = Queue() 
-
-    def update_frame(self, frame):
-        "Places a new `frame` in the queue."
-        with self.lock:
-            self.current_frame = frame
-            self.frame_queue.put(frame) 
-
-    def get_frame(self):
-        return self.frame_queue.get()
-
-    def update_prompt(self, prompt):
-        "Updates the generation prompt."
-        with self.lock:
-            self.current_prompt = prompt
-
-    def get_prompt(self):
-        "Gets the current generation prompt."
-        with self.lock:
-            return self.current_prompt
-
-
-class VideoStreamer:
-    "Reads frames from a video capture source."
-    def __init__(self, device_path: str):
-        self.cap = cv2.VideoCapture(device_path)
-        if not self.cap.isOpened():
-            logger.error("Failed to open video source")
-            raise ValueError("Video source cannot be opened")
-        for prop, value in Config.CAP_PROPS.items():
-            self.cap.set(getattr(cv2, prop), value)
-
-    def get_current_frame(self):
-        ret, frame = self.cap.read()
-        if not ret:
-            return None
-        return Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-
-    def release(self):
-        self.cap.release()
-
-
-def interpolate_images(image1, image2, alpha=0.5):
-    """Interpolate two images with a given `alpha` blending factor.
-    
-    output = (1 - alpha) * image1 + (alpha * image2)
-    """
-    if image1.size != image2.size:
-        image2 = image2.resize(image1.size)
-    return Image.blend(image1, image2, alpha)
-       
-       
-# Video processing class that handles the transformation and streaming
-class VideoProcessingThread(threading.Thread):
-    "Background thread for video processing."
-    def __init__(self, shared_resources, device_path=Config.VIDEO_PATH):
-        super().__init__(daemon=True)
-        self.shared_resources = shared_resources
-        self.stop_event = shared_resources.stop_event
-
-        # create the video streamer
-        self.video_streamer = VideoStreamer(device_path)
-        self.previous_frame = None
-
-    def run(self):
-        "Continuously transforms input video frames."
-        while not self.stop_event.is_set():
-
-            # grab the current frame
-            current_frame = self.video_streamer.get_current_frame()
-            if current_frame is None:
-                continue
-            
-            # grab the current prompt
-            current_prompt = self.shared_resources.get_prompt()
-
-            # transform the current frame
-            if current_prompt not in (None, ""):
-                transformed_frame = self.shared_resources.image_transformer.transform(
-                    current_frame,
-                    current_prompt,
-                )
-            else:
-                transformed_frame = current_frame
-
-            # interpolate it with the previous frame 
-            if self.previous_frame is not None:
-                final_frame = interpolate_images(self.previous_frame, transformed_frame, Config.FRAME_BLEND)
-            else:
-                final_frame = transformed_frame
-
-            # update the final frames
-            self.shared_resources.update_frame(final_frame)
-            self.previous_frame = final_frame
-
-            # sanity check for stopping
-            if self.stop_event.is_set(): break
-
-        # at the end, release the video source
-        self.video_streamer.release()
-
-
-class SDXL(BaseTransformer):
-    """Uses an SDXL model with ControlNet to generate images.
-    
-    The pipeline uses the 4-step UNet from SDXL-Lightning for faster generations.
-    It uses two ControlNet modules:
-        - One for depth
-        - Another for pose
-    """
-    def __init__(
-            self,
-            cfg=1.0,
-            strength=0.75,
-            canny_low_threshold=100,
-            canny_high_threshold=200,
-            controlnet_scale=[0.5, 0.5],
-            controlnet_start=0.0,
-            controlnet_end=1.0,
-            width=Config.WIDTH,
-            height=Config.HEIGHT,
-            dtype=Config.DTYPE,
-            scheduler=Config.SCHEDULER,
-            device=device,
-            **kwargs,
-        ):
-        store_attr()
-        self.generator = torch.Generator(device="cpu").manual_seed(Config.SEED)
-        super().__init__(device=device, **kwargs)
-
-    def _initialize_pipeline(self):
-        "Sets up the pipeline."
-
-        # initialize the depth control net
-        controlnet_depth = ControlNetModel.from_pretrained(
-            Config.CONTROLNET_DEPTH,
-            torch_dtype=self.dtype,
-            use_safetensors=True,
-        ).to(self.device)
-
-        # initialize the pose control net
-        controlnet_pose = ControlNetModel.from_pretrained(
-            Config.CONTROLNET_POSE,
-            torch_dtype=self.dtype,
-            # use_safetensors=True,
-        ).to(self.device) 
-
-        # model for depth estimation
-        self.depth_estimator = DPTForDepthEstimation.from_pretrained("Intel/dpt-hybrid-midas").to(self.device)
-        self.feature_extractor = DPTImageProcessor.from_pretrained("Intel/dpt-hybrid-midas")
-
-        # model for pose estimation
-        self.openpose = OpenposeDetector.from_pretrained("lllyasviel/ControlNet").to(self.device)
-
-        # load the Lightning UNet
-        unet_config = UNet2DConditionModel.load_config(Config.MODEL_ID, subfolder="unet")
-        unet = UNet2DConditionModel.from_config(unet_config).to(self.device, self.dtype)
-        unet.load_state_dict(
-            load_file(hf_hub_download(Config.UNET_ID, Config.UNET_CKPT), device=self.device)
-        )
-
-        # load in the fixed VAE
-        vae = AutoencoderKL.from_pretrained(
-            "madebyollin/sdxl-vae-fp16-fix",
-            torch_dtype=self.dtype
-        )
-        
-        # load the model with controlnets.
-        self.pipe = StableDiffusionXLControlNetPipeline.from_pretrained(
-            Config.MODEL_ID,
-            use_safetensors=True,
-            unet=unet,
-            vae=vae,
-            # NOTE: try using the same contorlnet twice, with different strengths and images
-            controlnet=[controlnet_depth, controlnet_pose],
-            # controlnet=controlnet_depth,
-        )
-
-        # sampler with trailing timesteps per the docs
-        # self.pipe.scheduler = EulerDiscreteScheduler.from_config(
-        self.pipe.scheduler = name2sched[self.scheduler].from_config(
-            self.pipe.scheduler.config,
-            timestep_spacing="trailing",
-        )
-
-        # final pipeline setup
-        self.pipe.set_progress_bar_config(disable=True)
-        self.pipe.to(device=self.device, dtype=self.dtype).to(self.device)
-        # optimizations assuming we're on a ~new GPU
-        if self.device != torch.device("mps"):
-            print("Set UNet to channels_last")
-            self.pipe.unet.to(memory_format=torch.channels_last)
-            self.pipe.controlnet.to(memory_format=torch.channels_last)
-        # print("Compiling the UNets...")
-        # self.pipe.unet = torch.compile(self.pipe.unet, mode="reduce-overhead", fullgraph=True)
-        # self.pipe.controlnet = torch.compile(self.pipe.controlnet, mode="reduce-overhead", fullgraph=True)
-        # print("UNet compiled.")
-
-        # start with a fixed set of latents
-        batch_size, num_images_per_prompt = 1, 1
-        batch_size *= num_images_per_prompt
-        num_channels_latents = self.pipe.unet.config.in_channels
-        self.latents_shape = (batch_size, num_channels_latents, self.height // self.pipe.vae_scale_factor, self.width // self.pipe.vae_scale_factor)
-        self.latents = self.refresh_latents()
-
-    def transform(self, image, prompt) -> Image.Image:
-        """Transforms the given `image` based on the `prompt`.
-        
-        Uses a controlnet to condition and manage the generation. 
-        """
-
-        # get the controlnet depth image
-        depth_image = self.get_depth_map(image)
-
-        # get the controlnet pose image
-        pose_image = self.get_pose_map(image)
-
-        # compute the number of steps
-        steps = self.num_steps
-        if int(steps * self.strength) < 1:
-            steps = math.ceil(1 / max(0.10, self.strength))
-
-        # generate and return the image
-        results = self.pipe(
-            prompt=prompt,
-            image=[depth_image, pose_image],
-            # image=depth_image,
-            negative_prompt=self.negative_prompt,
-            controlnet_conditioning_scale=self.controlnet_scale,
-            num_inference_steps=steps,
-            guidance_scale=self.cfg,
-            strength=self.strength,
-            control_guidance_start=self.controlnet_start,
-            control_guidance_end=self.controlnet_end,
-            width=self.width,
-            height=self.height,
-            output_type="pil",
-            generator=self.generator,
-            # add the fixed, starting latents
-            latents=self.get_latents(),
-        )
-        result_image = results.images[0]
-        return result_image
-    
-    def get_depth_map(self, image):
-        "Builds the controlnet depth map."
-        image = self.feature_extractor(images=image, return_tensors="pt").pixel_values.to(self.device)
-        with torch.no_grad(), torch.autocast(self.device):
-            depth_map = self.depth_estimator(image).predicted_depth
-
-        depth_map = torch.nn.functional.interpolate(
-            depth_map.unsqueeze(1),
-            size=(self.height, self.width),
-            mode="bicubic",
-            align_corners=False,
-        )
-        depth_min = torch.amin(depth_map, dim=[1, 2, 3], keepdim=True)
-        depth_max = torch.amax(depth_map, dim=[1, 2, 3], keepdim=True)
-        depth_map = (depth_map - depth_min) / (depth_max - depth_min)
-        image = torch.cat([depth_map] * 3, dim=1)
-
-        image = image.permute(0, 2, 3, 1).cpu().numpy()[0]
-        image = Image.fromarray((image * 255.0).clip(0, 255).astype(np.uint8))
-        return image
-    
-    def get_pose_map(self, image):
-        "Builds the controlnet pose map."
-        # with torch.no_grad(), torch.autocast(self.device):
-        pose_image = self.openpose(image)
-        pose_image = pose_image.resize((self.width, self.height))
-        return pose_image
-    
-    def get_latents(self):
-        "Returns a copy of the current latents, to prevent them from being overriden."
-        return self.latents.clone()
-
-    def refresh_latents(self):
-        "Creates a fixed set of latents for ~reproducible images."
-        latents = randn_tensor(self.latents_shape, generator=self.generator, device=torch.device(self.device), dtype=self.dtype)
-        return latents
-    
-
-# create the shared resources and start the video processing thread
+# Initialize shared resources from utils.py
 shared_resources = SharedResources()
-video_thread = VideoProcessingThread(shared_resources, device_path=Config.VIDEO_PATH)
+
+# Initialize model manager from tfm.py
+try:
+    transformer_manager = TransformerManager(
+        default_model=Config.DEFAULT_MODEL,
+        use_quantization=Config.USE_QUANTIZATION,
+        device=Config.DEVICE,
+        dtype=Config.DTYPE,
+        negative_prompt=Config.NEGATIVE_PROMPT
+    )
+    # Assign to shared resources for thread access
+    shared_resources.transformer_manager = transformer_manager
+    logger.info(f"TransformerManager initialized with default model: {Config.DEFAULT_MODEL}")
+except Exception as e:
+    logger.error(f"Failed to initialize transformer manager: {str(e)}")
+
+# Start video processing thread using the updated class from utils.py
+video_thread = VideoProcessingThread(shared_resources)
 video_thread.start()
 
 
-# Flask endpoint to serve the index page
-@app.route('/')
-def index():
-    return render_template('index.html')
+# UI Components
+def index_page():
+    """Build the main UI using MonsterUI components."""
+    return Container(
+        Grid(
+            # Video feed card
+            Card(
+                Img(id="videoFeed", src="", alt="Video Feed", cls="w-full"),
+                header=H3("SD 3.5 Video Transformer"),
+                footer=Div(id="status", cls=TextPresets.muted_sm)("Connecting...")
+            ),
+            # Controls card
+            Card(
+                Form(
+                    LabelInput("Prompt", id="promptInput", placeholder="Enter a prompt to transform the video..."),
+                    H4("Model Selection", cls="mt-4"),
+                    # Model selector using MonsterUI components
+                    Grid(
+                        *[Button(model.upper(), id=f"model-{model}", 
+                               cls=(ButtonT.primary if model == Config.DEFAULT_MODEL else ButtonT.secondary),
+                               hx_post=f"/api/set_model/{model}") 
+                          for model in Config.MODEL_TYPES],
+                        cols=2,
+                        cls="mb-4"
+                    ),
+                    DivFullySpaced(
+                        Button("Set Prompt", id="setPromptBtn", cls=ButtonT.primary, 
+                               hx_post="/api/set_prompt", hx_include="#promptInput"),
+                        Button("Refresh", id="refreshBtn", cls=ButtonT.secondary, 
+                               hx_post="/api/refresh_generator")
+                    )
+                ),
+                header=H3("Controls")
+            ),
+            # Stats card
+            Card(
+                Div(id="statsContent", cls="space-y-2")(
+                    DivHStacked(P("Device:"), P(id="device", cls=TextPresets.bold_sm)),
+                    DivHStacked(P("Model:"), P(id="model", cls=TextPresets.bold_sm)),
+                    DivHStacked(P("Frame Size:"), P(id="frameSize", cls=TextPresets.bold_sm)),
+                    DivHStacked(P("Steps:"), P(id="steps", cls=TextPresets.bold_sm)),
+                    DivHStacked(P("Connected Clients:"), P(id="connectedClients", cls=TextPresets.bold_sm)),
+                    DivHStacked(P("Memory Used:"), P(id="memoryUsed", cls=TextPresets.bold_sm)),
+                ),
+                header=H3("Stats"),
+                hx_get="/api/stats",
+                hx_trigger="load, every 5s"
+            ),
+            # Add model info card
+            Card(
+                Div(id="modelInfoContent")(
+                    H4("SD3.5 Turbo", cls=TextPresets.bold_lg),
+                    P("Fast model optimized for 4-step inference", cls=TextPresets.muted_sm),
+                    DividerLine(),
+                    Strong("Canny ControlNet"),
+                    P("Uses edge detection to guide generation", cls=TextPresets.muted_sm),
+                    DividerLine(),
+                    Strong("Depth ControlNet"),
+                    P("Uses depth maps for 3D-aware generation", cls=TextPresets.muted_sm),
+                    DividerLine(),
+                    Strong("Blur ControlNet"),
+                    P("Uses blurred images for upscaling", cls=TextPresets.muted_sm),
+                ),
+                header=H3("Model Information"),
+                hx_get=f"/api/model_info/{Config.DEFAULT_MODEL}",
+                hx_trigger="load"
+            ),
+            cols=Config.UI_COLUMNS,
+            cls="gap-4"
+        ),
+        # WebSocket client script 
+        Script("""
+document.addEventListener('DOMContentLoaded', function() {
+    const videoFeed = document.getElementById('videoFeed');
+    const status = document.getElementById('status');
+    
+    function connectWebSocket() {
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const wsUrl = `${protocol}//${window.location.host}/ws`;
+        
+        const ws = new WebSocket(wsUrl);
+        
+        ws.onopen = function() {
+            status.textContent = 'Connected';
+            status.classList.add('text-success');
+        };
+        
+        ws.onmessage = function(event) {
+            const data = JSON.parse(event.data);
+            
+            if (data.type === 'frame') {
+                videoFeed.src = `data:image/jpeg;base64,${data.data}`;
+            } else if (data.type === 'connected') {
+                status.textContent = data.message;
+                status.classList.add('text-success');
+            }
+        };
+        
+        ws.onclose = function() {
+            status.textContent = 'Disconnected. Reconnecting...';
+            status.classList.remove('text-success');
+            status.classList.add('text-error');
+            setTimeout(connectWebSocket, 1000);
+        };
+        
+        ws.onerror = function(error) {
+            console.error('WebSocket error:', error);
+            status.textContent = 'Connection error';
+            status.classList.remove('text-success');
+            status.classList.add('text-error');
+        };
+
+        // Set event listeners for model buttons
+        document.querySelectorAll('[id^="model-"]').forEach(button => {
+            button.addEventListener('click', function() {
+                // Reset all buttons to secondary
+                document.querySelectorAll('[id^="model-"]').forEach(btn => {
+                    btn.classList.remove('uk-btn-primary');
+                    btn.classList.add('uk-btn-secondary');
+                });
+                // Set clicked button to primary
+                this.classList.remove('uk-btn-secondary');
+                this.classList.add('uk-btn-primary');
+            });
+        });
+
+        // Set custom event listeners for HTMX endpoints
+        document.addEventListener('htmx:afterRequest', function(evt) {
+            if (evt.detail.pathInfo.requestPath === '/api/set_prompt') {
+                const promptInput = document.getElementById('promptInput');
+                if (evt.detail.successful) {
+                    status.textContent = `Prompt set: ${promptInput.value}`;
+                    status.classList.add('text-success');
+                    status.classList.remove('text-error');
+                } else {
+                    status.textContent = 'Error setting prompt';
+                    status.classList.remove('text-success');
+                    status.classList.add('text-error');
+                }
+            }
+            
+            if (evt.detail.pathInfo.requestPath === '/api/refresh_generator') {
+                if (evt.detail.successful) {
+                    status.textContent = 'Generator refreshed';
+                    status.classList.add('text-success');
+                    status.classList.remove('text-error');
+                } else {
+                    status.textContent = 'Error refreshing generator';
+                    status.classList.remove('text-success');
+                    status.classList.add('text-error');
+                }
+            }
+            
+            if (evt.detail.pathInfo.requestPath.startsWith('/api/set_model/')) {
+                if (evt.detail.successful) {
+                    const model = evt.detail.pathInfo.requestPath.split('/').pop();
+                    status.textContent = `Model set to: ${model.toUpperCase()}`;
+                    status.classList.add('text-success');
+                    status.classList.remove('text-error');
+                    
+                    // Update model info
+                    htmx.ajax('GET', `/api/model_info/${model}`, '#modelInfoContent');
+                } else {
+                    status.textContent = 'Error setting model';
+                    status.classList.remove('text-success');
+                    status.classList.add('text-error');
+                }
+            }
+        });
+    }
+
+    // Connect WebSocket when page loads
+    connectWebSocket();
+});
+        """)
+    )
 
 
-# Flask endpoint to set the prompt
-@app.route('/set_prompt', methods=['POST'])
-def set_prompt():
-    prompt = request.json.get('prompt')
-    if not prompt:
-        return jsonify({"error": "Prompt is required"}), 400
-    shared_resources.update_prompt(prompt)  # Update the prompt
-    return jsonify({"message": "Prompt set successfully"})
+# FastHTML routes
+@rt("/")
+def get():
+    """Render the main page."""
+    return Titled("SD 3.5 Video Transformer", index_page())
 
 
-# Flask endpoint to refresh the latents
-@app.route('/refresh_latents', methods=['POST'])
-def refresh_latents():
+@rt("/api/set_prompt")
+def post(prompt: str):
+    """Set the current prompt for image transformation."""
     try:
-        signal = request.json.get('signal')
-        if signal != "refresh":
-            return jsonify({"error": "Invalid signal"}), 400
+        if not prompt:
+            return {"error": "Prompt is required"}, 400
         
-        # refresh the latents
-        with shared_resources.lock:
-            shared_resources.image_transformer.refresh_latents()
-        
-        return jsonify({"message": "Latents refreshed"})
+        shared_resources.update_prompt(prompt)
+        return {"message": "Prompt set successfully"}
     except Exception as e:
-        logger.error(f"Error refreshing latents: {e}")
-        return jsonify({"error": "Could not refresh latents"}), 500
+        logger.error(f"Error setting prompt: {str(e)}")
+        return {"error": f"Could not set prompt: {str(e)}"}, 500
 
 
-# # Flask endpoint to stream the latest frame
-# @app.route('/stream')
-# def stream():
-#     def generate():
-#         while not shared_resources.stop_event.is_set():
-#             frame = shared_resources.get_frame()
-#             if frame is not None:
-#                 # rescale to better fit the image
-#                 frame = convert_to_pil_image(frame)
-#                 frame = frame.resize((Config.DISPLAY_WIDTH, Config.DISPLAY_HEIGHT))
-#                 img_byte_arr = BytesIO()
-#                 frame.save(img_byte_arr, format='JPEG')
-#                 img_byte_arr.seek(0)
-#                 encoded_img = base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
-#                 yield f"data: {encoded_img}\n\n"
-#                 time.sleep(1 / 30)  # Frame rate control
-
-#     return Response(stream_with_context(generate()), mimetype='text/event-stream')
+@rt("/api/set_model/{model_type}")
+def post(model_type: str):
+    """Set the current model type."""
+    try:
+        if model_type not in Config.MODEL_TYPES:
+            return {"error": f"Unknown model type: {model_type}"}, 400
+        
+        shared_resources.set_model(model_type)
+        return {"message": f"Model set to: {model_type}"}
+    except Exception as e:
+        logger.error(f"Error setting model: {str(e)}")
+        return {"error": f"Could not set model: {str(e)}"}, 500
 
 
-# WebSocket events for connection and streaming
-@socketio.on('connect')
-def handle_connect():
-    print('Client connected')
-    emit('connected', {'message': 'Connection established'})
+@rt("/api/refresh_generator")
+def post():
+    """Refresh the generator for the diffusion model."""
+    try:
+        # Reset the generator to get fresh randomness
+        with shared_resources.lock:
+            if shared_resources.transformer_manager:
+                # Get the current model's transformer
+                transformer = shared_resources.transformer_manager.get_transformer()
+                # Reset its generator with a new seed based on current time
+                transformer.generator = torch.Generator(device="cpu").manual_seed(int(time.time()))
+        
+        return {"message": "Generator refreshed"}
+    except Exception as e:
+        logger.error(f"Error refreshing generator: {str(e)}")
+        return {"error": f"Could not refresh generator: {str(e)}"}, 500
 
-@socketio.on('stream')
-def stream():
-    while not shared_resources.stop_event.is_set():
-        frame = shared_resources.get_frame()
-        if frame:
-            img_byte_arr = BytesIO()
-            # rescale to better display the image
-            frame = convert_to_pil_image(frame)
-            frame = frame.resize((Config.DISPLAY_WIDTH, Config.DISPLAY_HEIGHT))
-            frame.save(img_byte_arr, format='JPEG')
-            img_byte_arr.seek(0)
-            encoded_img = base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
-            emit('frame', {'data': encoded_img})  # Send frame to connected clients
-        time.sleep(0.1)  # Control frame rate
+
+@rt("/api/stats")
+def get():
+    """Get system statistics."""
+    try:
+        # Get model and device info from transformer manager
+        current_model = shared_resources.get_model()
+        device = Config.DEVICE
+        
+        # Get model-specific stats
+        if shared_resources.transformer_manager:
+            transformer = shared_resources.transformer_manager.get_transformer()
+            steps = getattr(transformer, 'num_inference_steps', Config.NUM_STEPS)
+        else:
+            steps = Config.NUM_STEPS
+        
+        # Memory info for CUDA
+        memory_used = "N/A"
+        if torch.cuda.is_available():
+            memory_used = f"{torch.cuda.memory_allocated() / 1024**3:.2f} GB"
+        
+        return Div(id="statsContent", cls="space-y-2")(
+            DivHStacked(P("Device:"), P(device, cls=TextPresets.bold_sm)),
+            DivHStacked(P("Model:"), P(current_model.upper(), cls=TextPresets.bold_sm)),
+            DivHStacked(P("Frame Size:"), P(f"{Config.WIDTH}x{Config.HEIGHT}", cls=TextPresets.bold_sm)),
+            DivHStacked(P("Steps:"), P(str(steps), cls=TextPresets.bold_sm)),
+            DivHStacked(P("Connected Clients:"), P(str(shared_resources.connected_clients), cls=TextPresets.bold_sm)),
+            DivHStacked(P("Memory Used:"), P(memory_used, cls=TextPresets.bold_sm)),
+        )
+    except Exception as e:
+        logger.error(f"Error getting stats: {str(e)}")
+        return Div(f"Could not get stats: {str(e)}", cls="text-error")
+
+
+@rt("/api/model_info/{model_type}")
+def get(model_type: str):
+    """Get information about a specific model."""
+    try:
+        model_info = {
+            "sd35": {
+                "title": "SD3.5 Turbo",
+                "description": "Fast model optimized for 4-step inference",
+                "steps": Config.NUM_STEPS,
+                "guidance": Config.CFG
+            },
+            "canny": {
+                "title": "Canny ControlNet",
+                "description": "Uses edge detection to guide generation",
+                "steps": Config.CONTROLNET_STEPS,
+                "guidance": Config.CONTROLNET_CFG
+            },
+            "depth": {
+                "title": "Depth ControlNet",
+                "description": "Uses depth maps for 3D-aware generation",
+                "steps": Config.CONTROLNET_STEPS,
+                "guidance": Config.CONTROLNET_CFG
+            },
+            "blur": {
+                "title": "Blur ControlNet",
+                "description": "Uses blurred images for upscaling",
+                "steps": Config.CONTROLNET_STEPS,
+                "guidance": Config.CONTROLNET_CFG
+            }
+        }
+        
+        if model_type not in model_info:
+            return {"error": f"Unknown model type: {model_type}"}, 400
+        
+        info = model_info[model_type]
+        
+        return Div(id="modelInfoContent")(
+            H4(info["title"], cls=TextPresets.bold_lg),
+            P(info["description"], cls=TextPresets.muted_sm),
+            DividerLine(),
+            Grid(
+                Div(Strong("Steps:"), P(str(info["steps"]), cls=TextPresets.muted_sm)),
+                Div(Strong("Guidance:"), P(str(info["guidance"]), cls=TextPresets.muted_sm)),
+                cols=2
+            ),
+            # Other model details could be added here
+        )
+    except Exception as e:
+        logger.error(f"Error getting model info: {str(e)}")
+        return Div(f"Could not get model info: {str(e)}", cls="text-error")
+
+
+# WebSocket endpoint for streaming frames
+@app.ws("/ws")
+async def ws(msg: str, send):
+    """Stream frames to the client via WebSocket."""
+    # Increment client count
+    client_id = shared_resources.increment_clients()
+    logger.info(f"Client {client_id} connected. Total clients: {shared_resources.connected_clients}")
+    
+    try:
+        # Send initial connection confirmation
+        await send({"type": "connected", "message": "Connection established"})
+        
+        frame_count = 0
+        while not shared_resources.stop_event.is_set():
+            frame = shared_resources.get_frame()
+            if frame:
+                frame_count += 1
+                # Only send every nth frame to reduce bandwidth
+                frame_skip = getattr(Config, 'FRAME_SKIP', 2)
+                if frame_count % frame_skip == 0:
+                    img_byte_arr = BytesIO()
+                    frame = convert_to_pil_image(frame)
+                    display_width = getattr(Config, 'DISPLAY_WIDTH', 640)
+                    display_height = getattr(Config, 'DISPLAY_HEIGHT', 480)
+                    frame = frame.resize((display_width, display_height))
+                    frame.save(img_byte_arr, format='JPEG', quality=85)
+                    img_byte_arr.seek(0)
+                    encoded_img = base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
+                    await send({
+                        "type": "frame",
+                        "data": encoded_img
+                    })
+            
+            # Control frame rate
+            await asyncio.sleep(0.1)
+    except Exception as e:
+        logger.error(f"WebSocket error: {str(e)}")
+    finally:
+        # Decrement client count
+        shared_resources.decrement_clients()
+        logger.info(f"Client {client_id} disconnected. Total clients: {shared_resources.connected_clients}")
 
 
 def cleanup():
-    "Cleanup resources at the end."
-    shared_resources.stop_event.set() 
-    video_thread.join() 
-    gc.collect()  
-    torch.cuda.empty_cache()  
+    """Clean up resources on application shutdown."""
+    logger.info("Application is shutting down. Cleaning up resources.")
+    shared_resources.stop_event.set()
+    video_thread.join(timeout=5.0)
+    
+    # Clean up transformer resources
+    if shared_resources.transformer_manager:
+        shared_resources.transformer_manager.cleanup()
+    
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
-# leave it better than we found it
+
+# Register cleanup handler
 atexit.register(cleanup)
 
-if __name__ == "__main__":
-    app.run(
-        host=Config.HOST, 
-        port=Config.PORT,
-        debug=True, 
-        threaded=True, 
-        use_reloader=False,
-    )
+# Start the application
+serve(port=Config.PORT, host=Config.HOST, reload=False)
