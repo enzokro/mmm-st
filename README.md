@@ -1,15 +1,5 @@
-# fractal-mirror
+# merlin-style-transfer
 
-# UV Install
-```
-# On macOS and Linux.
-$ curl -LsSf https://astral.sh/uv/install.sh | sh
+Transforms a video stream into a live, dynamic scene using a combination of Stable Diffusion 3.5 and ControlNet models.
 
-# On Windows.
-$ powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
-
-# With pip.
-$ pip install uv
-```
-
-Runs diffusion image transforms on a video stream.
+Built with MonsterUI, FastHTML, CV2, and HuggingFace Diffusers.
