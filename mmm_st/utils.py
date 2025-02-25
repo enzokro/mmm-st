@@ -59,7 +59,8 @@ if depth_models_available:
 
 if depthfm_available:
     try:
-        depthfm_model = DepthFM(ckpt_path="depthfm_model_checkpoints")
+        depthfm_checkpoints = getattr(Config, 'DEPTHFM_CHECKPOINTS', "")
+        depthfm_model = DepthFM(ckpt_path=depthfm_checkpoints)
         depthfm_model.eval()
         depthfm_model.to(Config.DEVICE)
         logger.info("DepthFM model loaded successfully")
